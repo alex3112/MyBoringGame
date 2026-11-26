@@ -314,7 +314,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
             if WaitForSingleObject(a.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
-                return Err(windows::core::Error::from_win32());
+                return Err(windows::core::Error::from_thread());
             }
         }
         // A removed device signals fences with UINT64_MAX; that is not a
