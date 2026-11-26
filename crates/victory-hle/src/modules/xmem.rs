@@ -177,6 +177,9 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::memory_audit::VIRTUAL_COMMIT_CALL_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+    }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
@@ -347,6 +350,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        victory_gpu::memory_audit::TITLE_HEAP.add(layout.size() as u64);
         user.cast()
     }
 }
@@ -365,6 +369,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::memory_audit::TITLE_HEAP.remove(size as u64);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -435,7 +440,10 @@ impl Section {
                 return None;
             }
             for p in page..page + run {
-                self.committed[p / 64].fetch_or(1 << (p % 64), Ordering::AcqRel);
+                let bit = 1 << (p % 64);
+                if self.committed[p / 64].fetch_or(bit, Ordering::AcqRel) & bit == 0 {
+                    victory_gpu::memory_audit::TITLE_SECTION_COMMIT.add(PAGE as u64);
+                }
             }
             page += run;
         }
@@ -464,7 +472,9 @@ impl Section {
         }
         for p in pages {
             let (word, bit) = bit(p);
-            word.fetch_or(bit, Ordering::AcqRel);
+            if word.fetch_or(bit, Ordering::AcqRel) & bit == 0 {
+                victory_gpu::memory_audit::TITLE_SECTION_COMMIT.add(PAGE as u64);
+            }
         }
         true
     }
@@ -488,6 +498,9 @@ impl Drop for Section {
                 })
             };
         }
+        let committed: u64 = self.committed.iter().map(|w| u64::from(w.load(Ordering::Relaxed).count_ones())).sum();
+        victory_gpu::memory_audit::TITLE_SECTION_COMMIT.remove(committed * PAGE as u64);
+        victory_gpu::memory_audit::TITLE_SECTION_RESERVED.remove((self.pages * PAGE) as u64);
         victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
@@ -678,6 +691,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::memory_audit::TITLE_SECTION_RESERVED.add(size as u64);
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -1877,7 +1891,12 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let freed = unsafe { VirtualFree(address, size, kind) };
+    if freed != 0 {
+        victory_gpu::memory_audit::VIRTUAL_FREE_CALL_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        victory_gpu::memory_audit::VIRTUAL_FREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    freed
 }
 
 pub(crate) fn module() -> HleModule {

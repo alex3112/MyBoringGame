@@ -846,7 +846,6 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }

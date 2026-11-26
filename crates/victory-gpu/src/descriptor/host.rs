@@ -112,6 +112,8 @@ impl Made {
 }
 
 pub(crate) struct HostHeap {
+    _audit_native: crate::memory_audit::Lease,
+    _audit_cpu: crate::memory_audit::Lease,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1591,6 +1593,13 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            _audit_native: crate::memory_audit::DESCRIPTOR_NATIVE.lease(size as u64 * step as u64),
+            // Fixed slot metadata only; excludes dynamically grown maps and the driver's storage.
+            _audit_cpu: crate::memory_audit::DESCRIPTOR_CPU.lease(
+                u64::from(count + extra) * size_of::<Mutex<Option<ID3D12Resource>>>() as u64
+                    + u64::from(count) * (16 + if sampler { 0 } else { 4 })
+                    + if raw == 0 { 0 } else { u64::from(count + extra) }
+            ),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,

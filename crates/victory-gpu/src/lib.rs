@@ -62,6 +62,8 @@ pub mod queue;
 pub mod replay;
 #[cfg(windows)]
 mod residency;
+#[cfg(windows)]
+pub mod memory_audit;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

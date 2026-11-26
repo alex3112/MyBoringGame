@@ -368,6 +368,14 @@ pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
+/// Physical block capacity; the logical pieces are a subset, not additive.
+pub(crate) fn audit() -> [Option<u64>; 2] {
+    [
+        TEXTURES.try_lock().ok().map(|p| p.blocks() as u64 * BLOCK),
+        STAGING.try_lock().ok().map(|p| p.blocks() as u64 * BLOCK),
+    ]
+}
+
 /// Part of a block of mapped upload memory, back in the pool when dropped.
 pub(crate) struct StagingPiece(Piece);
 

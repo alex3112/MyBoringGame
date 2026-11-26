@@ -2500,6 +2500,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if let Some(bytes) = self.before.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            crate::memory_audit::SNAPSHOT.remove(bytes.capacity() as u64);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2894,6 +2897,29 @@ pub(crate) fn memory() -> [u64; 6] {
     ]
 }
 
+/// Independent sampler: never wait for a rendering lock.
+pub(crate) fn audit() -> [Option<u64>; 9] {
+    let mut out = [None; 9];
+    out[0] = Some(LIVE[0].load(Ordering::Relaxed));
+    out[1] = Some(LIVE[1].load(Ordering::Relaxed));
+    out[2] = Some(live_span_bytes());
+    out[3] = Some(CARD_BYTES[1].load(Ordering::Relaxed));
+    out[4] = Some(KEPT_BYTES.load(Ordering::Relaxed));
+    if let Ok(pool) = POOL.try_lock() {
+        out[5] = Some(pool.iter().map(|v| v.capacity() as u64).sum());
+    }
+    if let Ok(loose) = LOOSE.try_read() {
+        out[6] = Some(loose.keys().map(|&(_, len)| len).sum());
+        out[7] = Some(cover(loose.keys().copied()));
+        out[8] = Some(loose.values().map(|s| {
+            let from = s.asked[0].load(Ordering::Relaxed);
+            let to = s.asked[1].load(Ordering::Relaxed);
+            to.saturating_sub(from).min(s.len)
+        }).sum());
+    }
+    out
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -3103,7 +3129,11 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
+        let snapshot = before.get_or_insert_with(|| {
+            let bytes = pooled(total);
+            crate::memory_audit::SNAPSHOT.add(bytes.capacity() as u64);
+            bytes
+        });
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -3415,6 +3445,7 @@ impl Shadow {
             kept.0.clear();
         }
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            crate::memory_audit::SNAPSHOT.remove(bytes.capacity() as u64);
             give_back(bytes);
         }
     }

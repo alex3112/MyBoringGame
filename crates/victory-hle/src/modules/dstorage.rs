@@ -1408,13 +1408,20 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let _source_audit = match &source {
+        Cow::Owned(bytes) => Some(victory_gpu::memory_audit::STORAGE.lease(bytes.capacity() as u64)),
+        Cow::Borrowed(_) => None,
+    };
+    let _packed_audit;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
+        _packed_audit = Some(victory_gpu::memory_audit::STORAGE.lease(packed.capacity() as u64));
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
+        _packed_audit = None;
         source
     };
     into_destination(request, size, |out| match tables {
@@ -1657,6 +1664,7 @@ fn into_pages(
         return filled;
     }
     let mut data = vec![0; len];
+    let _audit = victory_gpu::memory_audit::STORAGE.lease(data.capacity() as u64);
     let n = fill(&mut data)?;
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
