@@ -5306,12 +5306,12 @@ pub(crate) static WINDOW_REUSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2
 /// A sized request can share a containing window. Unsized views must also
 /// preserve their original upper bound because shaders can read to its end.
 fn containing_window(
-    keys: impl Iterator<Item = WindowKey>, wanted: WindowKey, unsized: bool,
+    keys: impl Iterator<Item = WindowKey>, wanted: WindowKey, unsized_ask: bool,
 ) -> Option<WindowKey> {
     let end = wanted.0.checked_add(wanted.1)?;
     keys.filter(|&(start, bytes)| {
         start <= wanted.0 && start.checked_add(bytes).is_some_and(|last| {
-            last >= end && (!unsized || last == end)
+            last >= end && (!unsized_ask || last == end)
         })
     }).min_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
