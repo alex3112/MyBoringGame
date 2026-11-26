@@ -4760,6 +4760,9 @@ impl Host {
         let check_on = torn::on() && f.queue.is_some();
         let mut first = 0;
         let mut after_all = u64::MAX;
+        // A hash piece can have several declared subranges in different
+        // batches. Any suspect observation must survive the entire landing.
+        let mut checked = std::collections::HashMap::<torn::Piece, bool>::new();
         while first < pieces.len() {
             let mut last = first;
             let mut charged = 0;
@@ -4824,7 +4827,10 @@ impl Host {
                         fence.SetEventOnCompletion(sent, event)?;
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(None);
-                        WaitForSingleObject(event, INFINITE);
+                        if WaitForSingleObject(event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                            return Err(windows::core::Error::from_thread());
+                        }
+                        self.device.GetDeviceRemovedReason()?;
                         return Ok(behind);
                     }
                     // In the order of the queue: the sends of title bytes so
@@ -4839,7 +4845,10 @@ impl Host {
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
-                    WaitForSingleObject(event, INFINITE);
+                    if WaitForSingleObject(event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                            return Err(windows::core::Error::from_thread());
+                        }
+                        self.device.GetDeviceRemovedReason()?;
                     Ok(after)
                 })()
             };
@@ -4905,7 +4914,7 @@ impl Host {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             if let Some(f) = fetch.as_mut() {
                 if let Some(check) = &check {
-                    check.done(&mut f.suspects);
+                    check.accumulate(&mut checked);
                 }
                 f.had.fetched(
                     ahead,
@@ -4915,6 +4924,11 @@ impl Host {
             // Keep the send history until every batch has been merged.
             after_all = after_all.min(after);
             first = last;
+        }
+        if let Some(f) = fetch.as_mut() {
+            for (piece, same) in checked {
+                f.suspects.fetched(piece, same);
+            }
         }
         crate::shadow::relay_fetched(after_all);
     }
@@ -9611,7 +9625,6 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 MEMORY_REUSE[5].fetch_add(1, Ordering::Relaxed);
-                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }

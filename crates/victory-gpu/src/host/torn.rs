@@ -142,13 +142,18 @@ impl Check {
         self.found[i].store(if self::hash(bytes) == hash { 1 } else { 2 }, Ordering::Relaxed);
     }
 
-    /// All is landed: what was found is kept for later flights.
-    pub(super) fn done(&self, suspects: &mut Suspects) {
+    /// Combine observations from all bounded fetch batches before updating
+    /// the persistent suspects. A good hash in a later batch must not hide
+    /// an earlier torn observation of another part of the same piece.
+    pub(super) fn accumulate(&self, checked: &mut HashMap<Piece, bool>) {
         for ((piece, _), found) in self.of.iter().zip(&self.found) {
             match found.load(Ordering::Relaxed) {
                 // Not compared on the card: fetched by every flight.
                 0 => {}
-                found => suspects.fetched(*piece, found == 1),
+                found => {
+                    let same = found == 1;
+                    checked.entry(*piece).and_modify(|previous| *previous &= same).or_insert(same);
+                }
             }
         }
     }

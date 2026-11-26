@@ -5343,20 +5343,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Resolve a stable alias before an exact key: the latter may have been
     // created by a different kind of request after a descriptor was made.
-    if !tails() {
+    {
+        // One read guard across both lookups: a writer cannot insert an
+        // alias between checking it and taking the exact allocation.
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(key) = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).get(&(named, unsized_ask))
-            && let Some(shadow) = map.get(key)
-        {
-            note(shadow);
-            reused_window(shadow, named);
-            return Some(shadow.clone());
+        if !tails() {
+            if let Some(key) = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).get(&(named, unsized_ask))
+                && let Some(shadow) = map.get(key)
+            {
+                note(shadow);
+                reused_window(shadow, named);
+                return Some(shadow.clone());
+            }
         }
-    }
-    // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        // The window is there already (nearly always).
+        if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask)
+            && let Some(shadow) = map.get(&named)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
