@@ -120,6 +120,9 @@ struct List {
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
+    /// A THIN translation backend only acquires native objects on its first command.
+    #[cfg(windows)]
+    lazy_host: bool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
@@ -240,6 +243,38 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+#[cfg(windows)]
+static LAZY_DETACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static LAZY_ACQUIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Acquire an open native list only when translating a real command.
+#[cfg(windows)]
+fn ensure_translation_host(list: &mut List) {
+    debug_assert!(list.lazy_host);
+    if list.host.is_none() {
+        list.host = Some(fresh_list().unwrap_or_else(|| {
+            crate::host::fail(format_args!("could not acquire native list for THIN translation"))
+        }));
+        LAZY_ACQUIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn audit() -> [Option<u64>; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let idle = IDLE.try_lock().ok().map(|p| p.0.len() as u64);
+    [
+        idle,
+        thin::idle_backs(),
+        LAZY_ACQUIRED.load(Relaxed).into(),
+        LAZY_DETACHED.load(Relaxed).into(),
+        POOL_HITS.load(Relaxed).into(),
+    ]
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -261,7 +296,10 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(list)
+        },
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -371,9 +409,9 @@ pub(crate) fn cut_list(this: This) -> bool {
 #[cfg(windows)]
 pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 
-/// Takes the host sides of the submitted `lists`, part by part ([`cut`]),
-/// and leaves each list a new, closed host list for its next reset, as
-/// [`detach`] does. What comes back is in the order the queue runs it: a
+/// Takes the host sides of the submitted `lists`, part by part ([`cut`]).
+/// THIN translation backends remain without native objects until they record again,
+/// as in [`detach`]. What comes back is in the order the queue runs it: a
 /// new entry starts at every part that has waits; host lists without
 /// waits join the entry before them. The list's upload memory and draw
 /// state (its dynamic descriptor slots) go with its last part, which runs
@@ -403,16 +441,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_for_submission(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -460,9 +492,28 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     parts
 }
 
+/// The native list belongs to the submission until its fence has completed.
+/// A THIN backend needs no replacement: its next recording borrows from IDLE.
+/// Keep the established direct-recording behaviour for non-THIN lists.
+#[cfg(windows)]
+fn take_for_submission(list: &mut List) -> Option<crate::host::HostList> {
+    if list.lazy_host {
+        let taken = list.host.take();
+        if taken.is_some() {
+            LAZY_DETACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return taken;
+    }
+    if list.host.is_none() {
+        return None;
+    }
+    let fresh = fresh_list()?;
+    fresh.close();
+    list.host.replace(fresh)
+}
+
 /// Takes the host sides of submitted lists (each once, however often the
-/// submission names it) and leaves each list a new, closed host list for
-/// its next reset: what was taken, and which of them run in what order.
+/// submission names it): what was taken, and which run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
@@ -475,17 +526,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_for_submission(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -575,17 +620,17 @@ fn new_list(
     tracing::debug!(kind, "command list");
     #[cfg(windows)]
     if thin::on() {
-        let mut list = boxed(kind, pipeline, true);
+        let mut list = boxed(kind, pipeline, true, false);
         list.thin.begin(kind, pipeline);
         return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     }
-    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+    object::hand_out(LIST, boxed(kind, pipeline, false, false), iid, &LIST_IIDS, out)
 }
 
 /// A list; with `thin` one whose calls are written down (it has no host list).
-fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+fn boxed(kind: u32, pipeline: This, thin: bool, lazy_host: bool) -> Box<List> {
     #[cfg(not(windows))]
-    let _ = thin;
+    let _ = (thin, lazy_host);
     let list = Box::new(List {
         object: match (crate::device::newer(), thin) {
             (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
@@ -606,13 +651,15 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: (!thin && !lazy_host).then(crate::host::host).flatten().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
         }),
+        #[cfg(windows)]
+        lazy_host,
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -686,10 +733,15 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
     }
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
+    {
+        // SAFETY: exclusive recording/reset of this list. The lazy backend
+        // can reset its logical state without allocating a native list.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        if let Some(host) = list.host.as_ref() {
+            host.reset();
+        }
+        list.state.lock().unwrap_or_else(|e| e.into_inner()).reset(pipeline);
+    }
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;

@@ -164,8 +164,12 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
-/// Lists of ours nobody uses, closed.
+/// Lightweight translation backends, never holding native objects while idle.
 static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub(super) fn idle_backs() -> Option<u64> {
+    BACKS.try_lock().ok().map(|b| b.len() as u64)
+}
 /// Since the last line of the log: streams handed over; calls translated and
 /// the microseconds that took (all threads), recordings translated, and
 /// recordings let go of in the middle.
@@ -272,7 +276,18 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            // SAFETY: Recording owns this backend; no translation worker or
+            // queue can still name it when the last Arc is dropped. Submitted
+            // native lists have already moved into Detached; anything still
+            // here was never submitted. Do not retain native objects, upload
+            // memory or descriptor state on the lightweight backend.
+            let mut back = unsafe { Box::from_raw(inner.back as *mut List) };
+            back.host = None;
+            back.earlier.clear();
+            back.gate.clear();
+            back.uploads.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+            *back.state.get_mut().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            held(&BACKS).push(Box::into_raw(back) as usize);
         }
     }
 }
@@ -287,16 +302,14 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
-/// A list of ours, closed.
+/// A logical translation backend, with no native list attached.
 fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
-    super::close(list);
-    list
+    Box::into_raw(super::boxed(kind, std::ptr::null(), false, true)).cast_const().cast()
 }
 
 fn start() {
@@ -701,6 +714,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        // RESET/CLOSE-only recordings never need a native list. UPLOAD is
+        // handled above and is retained until the backend is submitted/dropped.
+        // Every other translated operation can touch host state, including
+        // waits and barriers, so acquire before dispatching it.
+        if op != RESET && op != CLOSE {
+            // SAFETY: this worker owns the translation of this recording.
+            super::ensure_translation_host(unsafe { &mut *list.cast_mut().cast::<List>() });
         }
         if run_plain(op, list, w) {
             continue;
