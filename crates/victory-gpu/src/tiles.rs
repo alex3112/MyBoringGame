@@ -49,10 +49,12 @@
 //! every other texture is made as before. Off unless
 //! `VICTORY_LEVELS_ON_DEMAND=1`.
 
-use std::sync::Mutex;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 use crate::host::host;
 
@@ -283,7 +285,83 @@ pub(crate) struct Tiled {
     claimed: AtomicU32,
 }
 
+// The descriptor heap and retired GPU work can hold the native resource
+// without holding HostTexture. Tie the tile allocation to the native COM
+// resource's lifetime, just as pool.rs does for ordinary placed textures.
+#[repr(C)]
+struct TileOwner {
+    methods: &'static [*const (); 3],
+    references: AtomicU32,
+    _tiles: Arc<Tiled>,
+}
+
+struct OwnerMethods([*const (); 3]);
+// SAFETY: immutable function addresses.
+unsafe impl Sync for OwnerMethods {}
+static OWNER_METHODS: OwnerMethods = OwnerMethods([
+    owner_query as *const (),
+    owner_add_ref as *const (),
+    owner_release as *const (),
+]);
+
+unsafe extern "system" fn owner_query(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    const E_NOINTERFACE: HRESULT = HRESULT(0x8000_4002_u32 as i32);
+    // SAFETY: COM's arguments and this object's IUnknown vtable.
+    unsafe {
+        if out.is_null() {
+            return HRESULT(0x8000_4003_u32 as i32);
+        }
+        *out = std::ptr::null_mut();
+        if iid.as_ref().is_some_and(|iid| *iid == IUnknown::IID) {
+            owner_add_ref(this);
+            *out = this;
+            return HRESULT(0);
+        }
+    }
+    E_NOINTERFACE
+}
+
+unsafe extern "system" fn owner_add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: a live TileOwner reached through IUnknown.
+    unsafe { (*this.cast::<TileOwner>()).references.fetch_add(1, Ordering::Relaxed) + 1 }
+}
+
+unsafe extern "system" fn owner_release(this: *mut c_void) -> u32 {
+    // SAFETY: the last IUnknown reference owns the box and its tile lease.
+    unsafe {
+        let left = (*this.cast::<TileOwner>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
+        if left == 0 {
+            drop(Box::from_raw(this.cast::<TileOwner>()));
+        }
+        left
+    }
+}
+
 impl Tiled {
+    /// Keep the tile lease alive until the last native resource reference
+    /// is released, even if its Rust HostTexture wrapper has gone away.
+    /// This is called before any tiles are allocated. If attaching fails,
+    /// the caller discards the reserved texture and uses a normal texture.
+    pub(crate) fn retain_with(self, texture: &ID3D12Resource) -> Option<Arc<Self>> {
+        const KEY: GUID = GUID::from_u128(0x3e9b613a_7740_42c4_a5d7_4fb6c8378ea1);
+        let tiles = Arc::new(self);
+        let owner = Box::into_raw(Box::new(TileOwner {
+            methods: &OWNER_METHODS.0,
+            references: AtomicU32::new(1),
+            _tiles: tiles.clone(),
+        }));
+        // SAFETY: our COM object starts with one reference. On success
+        // SetPrivateDataInterface takes another, released with the texture.
+        unsafe {
+            let object = IUnknown::from_raw(owner.cast());
+            if let Err(e) = texture.SetPrivateDataInterface(&KEY, &object) {
+                tracing::warn!(error = %e, "could not attach tile lifetime to reserved texture");
+                return None;
+            }
+        }
+        Some(tiles)
+    }
+
     /// For `texture`, just made reserved with `levels` levels and one
     /// layer: how the card cuts it into tiles. `None` if the card will not
     /// say, or cuts it in a way this does not handle; the caller then makes

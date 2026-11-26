@@ -1166,7 +1166,7 @@ pub(crate) struct HostTexture {
     /// Made without memory of its own (`crate::tiles`): the tiles its
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
-    pub(crate) tiled: Option<crate::tiles::Tiled>,
+    pub(crate) tiled: Option<std::sync::Arc<crate::tiles::Tiled>>,
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
@@ -1566,7 +1566,8 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)))
+                .and_then(|cut| cut.retain_with(reserved.as_ref()?));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -2307,7 +2308,7 @@ impl HostTexture {
     fn new_tiled(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
         state: u32,
-        tiled: crate::tiles::Tiled,
+        tiled: std::sync::Arc<crate::tiles::Tiled>,
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: a live texture.
@@ -2586,7 +2587,7 @@ unsafe impl Sync for OnDemand {}
 #[cfg(windows)]
 impl OnDemand {
     pub(crate) fn tiled(&self) -> Option<&crate::tiles::Tiled> {
-        self.0.tiled.as_ref()
+        self.0.tiled.as_deref()
     }
 
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
