@@ -121,15 +121,20 @@ fn write_row(w: &mut impl Write, row: &[Option<u64>]) -> std::io::Result<()> {
 
 /// Start before executing the title. No GPU device is created by the sampler.
 /// Each row is flushed so a sudden exit retains all completed samples.
-pub fn start() {
-    if std::env::var_os("VICTORY_MEMORY_AUDIT").is_some_and(|v| v == "0") { return; }
+pub fn start() -> std::io::Result<()> {
+    if std::env::var_os("VICTORY_MEMORY_AUDIT").is_some_and(|v| v == "0") {
+        eprintln!("Memory audit disabled by VICTORY_MEMORY_AUDIT=0");
+        return Ok(());
+    }
     let path = std::env::var_os("VICTORY_MEMORY_AUDIT_PATH").map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.join("memory_audit.csv")))
             .unwrap_or_else(|| "memory_audit.csv".into()));
-    let file = match std::fs::File::create(&path) {
-        Ok(f) => f,
-        Err(e) => { tracing::warn!(path = %path.display(), error = %e, "memory audit unavailable"); return; }
-    };
+    // Resolve the output before any title image is mapped or executed.
+    let path = std::path::absolute(path)?;
+    eprintln!("Memory audit output: {}", path.display());
+    let file = std::fs::File::create(&path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("creating {}: {e}", path.display()))
+    })?;
     let mut writer = BufWriter::new(file);
     let mut names: Vec<String> = NAMES.iter().map(|s| (*s).into()).collect();
     for (name, _) in METERS {
@@ -137,18 +142,24 @@ pub fn start() {
             names.push(format!("{name}_{suffix}"));
         }
     }
-    if writeln!(writer, "{}", names.join(",")).and_then(|()| writer.flush()).is_err() { return; }
+    writeln!(writer, "{}", names.join(","))?;
+    writer.flush()?;
     let start = Instant::now();
-    if write_row(&mut writer, &sample(start)).is_err() { return; }
-    tracing::info!(path = %path.display(), "memory audit enabled (one sample per second)");
-    if let Err(e) = std::thread::Builder::new().name("victory-memory-audit".into()).spawn(move || {
+    let first = sample(start);
+    if first.len() != names.len() {
+        return Err(std::io::Error::other(format!("memory audit schema mismatch: {} columns, {} values", names.len(), first.len())));
+    }
+    write_row(&mut writer, &first)?;
+    std::thread::Builder::new().name("victory-memory-audit".into()).spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let row = sample(start);
             if let Err(e) = write_row(&mut writer, &row) {
-                tracing::warn!(error = %e, "memory audit stopped");
+                eprintln!("Memory audit stopped: {e}");
                 break;
             }
         }
-    }) { tracing::warn!(error = %e, "memory audit thread unavailable"); }
+    })?;
+    eprintln!("Memory audit active: {} (one sample per second)", path.display());
+    Ok(())
 }
