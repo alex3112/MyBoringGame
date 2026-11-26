@@ -2309,7 +2309,7 @@ struct Deferred {
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    refreshed: ByCopy<RefreshCoverage>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2340,6 +2340,64 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+}
+
+/// The common case is a single range: no separate allocation. Only
+/// already covered requests are elided; a partly new request is recorded
+/// unchanged, at its original place relative to GPU writes.
+#[derive(Default)]
+struct RefreshCoverage {
+    first: Option<(usize, usize)>,
+    more: Vec<(usize, usize)>,
+}
+
+impl RefreshCoverage {
+    fn remember(&mut self, from: usize, to: usize) -> bool {
+        if from >= to { return false; }
+        let contains = |r: (usize, usize)| r.0 <= from && to <= r.1;
+        if self.first.is_some_and(contains) || self.more.iter().copied().any(contains) {
+            return false;
+        }
+        let mut span = (from, to);
+        // All saved spans are disjoint and non-adjacent, so joining one
+        // cannot reach a previously skipped one.
+        if self.first.is_some_and(|r| r.0 <= span.1 && span.0 <= r.1) {
+            let r = self.first.take().unwrap();
+            span = (span.0.min(r.0), span.1.max(r.1));
+        }
+        self.more.retain(|r| {
+            if r.0 <= span.1 && span.0 <= r.1 {
+                span = (span.0.min(r.0), span.1.max(r.1));
+                false
+            } else { true }
+        });
+        if self.first.is_none() {
+            self.first = Some(span);
+        } else {
+            self.more.push(span);
+        }
+        true
+    }
+}
+
+pub(crate) static REFRESH_REUSE: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+// Recorded coverage skips and bytes; submission coverage skips and bytes.
+
+#[cfg(test)]
+#[test]
+fn refresh_coverage_does_not_fill_holes() {
+    let mut c = RefreshCoverage::default();
+    assert!(c.remember(10, 20));
+    assert!(c.remember(30, 40));
+    assert!(!c.remember(12, 18));
+    assert!(!c.remember(31, 39));
+    assert!(c.remember(15, 35));
+    assert!(!c.remember(10, 40));
+    assert!(c.remember(40, 50));
+    assert!(!c.remember(10, 50));
+    c = RefreshCoverage::default();
+    assert!(c.remember(10, 50));
 }
 
 impl Deferred {
@@ -7019,11 +7077,13 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let Some(end) = address.checked_add(len) else { return };
+        if deferred.refreshed.entry(key).or_default().remember(address, end) {
+            deferred.copies.push(Step::Refresh(shadow.clone(), address, len));
+        } else {
+            REFRESH_REUSE[0].fetch_add(1, Ordering::Relaxed);
+            REFRESH_REUSE[1].fetch_add(len as u64, Ordering::Relaxed);
         }
     }
 
@@ -8079,6 +8139,8 @@ impl Batch {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            REFRESH_REUSE[2].fetch_add(1, Ordering::Relaxed);
+            REFRESH_REUSE[3].fetch_add(len as u64, Ordering::Relaxed);
             return;
         }
         match self.index.get(&key) {

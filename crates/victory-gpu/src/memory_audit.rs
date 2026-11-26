@@ -80,6 +80,10 @@ const NAMES: &[&str] = &[
     "scratch_page_pool_capacity_bytes", "small_staging_pool_capacity_bytes", "scratch_slices_cumulative", "scratch_slice_bytes_cumulative",
     "small_staging_slices_cumulative", "small_staging_slice_bytes_cumulative", "zero_upload_cache_capacity_bytes",
     "zero_upload_reuses_cumulative", "zero_upload_reused_bytes_cumulative",
+    "record_refresh_coverage_skips_cumulative", "record_refresh_coverage_bytes_cumulative",
+    "submit_refresh_coverage_skips_cumulative", "submit_refresh_coverage_bytes_cumulative",
+    "journal_clean_blocks_cumulative", "journal_clean_block_bytes_cumulative",
+    "journal_ahead_pass_skips_cumulative", "journal_ahead_range_skips_cumulative",
 ];
 
 fn sample(start: Instant) -> Vec<Option<u64>> {
@@ -122,6 +126,8 @@ fn sample(start: Instant) -> Vec<Option<u64>> {
     row.extend(crate::host::MEMORY_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     row.extend(crate::pool::upload_audit());
     row.extend(crate::host::ZERO_REUSE.iter().map(|n| Some(n.load(Relaxed))));
+    row.extend(crate::host::REFRESH_REUSE.iter().map(|n| Some(n.load(Relaxed))));
+    row.extend(crate::watch::JOURNAL_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     for (_, meter) in METERS { row.extend(meter.sample().map(Some)); }
     row
 }

@@ -59,6 +59,10 @@ impl Journal {
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.insert(page, now).unwrap_or(0);
+        // A conservative upper bound: a newer write anywhere in this
+        // block only forces the exact test, never a false clean answer.
+        let latest = self.latest.entry(page / JOURNAL_BLOCK).or_default();
+        *latest = (*latest).max(now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -118,7 +122,13 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+const JOURNAL_BLOCK: usize = 64; // 4 MiB of title addresses
+pub(crate) static JOURNAL_REUSE: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+// Clean block shortcuts, bytes covered, ahead passes skipped, ranges skipped.
+
 struct Journal {
+    latest: BTreeMap<usize, u64>,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
@@ -143,6 +153,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
+    latest: BTreeMap::new(),
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
@@ -313,6 +324,14 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // When ask_once already established its journal, do not allocate,
+    // filter, sort or consult the guard bits again for this flush.
+    if journal().kept {
+        use std::sync::atomic::Ordering::Relaxed;
+        JOURNAL_REUSE[2].fetch_add(1, Relaxed);
+        JOURNAL_REUSE[3].fetch_add(ranges.len() as u64, Relaxed);
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -752,8 +771,35 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    if first >= last { return true; }
+    if last - first < JOURNAL_BLOCK {
+        return (ranged != 0 || taken.iter().all(|&at| at != 0))
+            && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged));
+    }
+    // A block can be skipped only if *every* page has been taken, or a
+    // complete-range stamp proves it, and its maximum write is no newer
+    // than the oldest such stamp. Hot blocks still get the exact test.
+    let mut skipped = 0u64;
+    let mut bytes = 0u64;
+    let mut page = first;
+    while page < last {
+        let block = page / JOURNAL_BLOCK;
+        let end = last.min((block + 1) * JOURNAL_BLOCK);
+        let stamps = &taken[page - first..end - first];
+        let floor = stamps.iter().copied().min().unwrap_or(0).max(ranged);
+        if floor == 0 { return false; }
+        if j.latest.get(&block).copied().unwrap_or(0) <= floor {
+            skipped += 1;
+            bytes += ((end - page) * PAGE) as u64;
+        } else if !j.written.range(page..end).all(|(&p, &write)| write <= taken[p - first].max(ranged)) {
+            return false;
+        }
+        page = end;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    JOURNAL_REUSE[0].fetch_add(skipped, Relaxed);
+    JOURNAL_REUSE[1].fetch_add(bytes, Relaxed);
+    true
 }
 
 impl Tracked {
@@ -2670,7 +2716,8 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
-            written: BTreeMap::new(),
+            latest: BTreeMap::new(),
+    written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
             ahead_asked: 0,
