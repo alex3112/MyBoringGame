@@ -527,17 +527,95 @@ fn bury_lag() -> u64 {
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
-fn bury(finished: u64) {
+fn take_retired(finished: u64) -> Vec<(u64, Retired)> {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+    retired.drain(..n).collect()
+}
+
+fn bury(finished: u64) {
+    drop(take_retired(finished));
+}
+
+// Only objects already eligible under the unchanged completion/lag rule
+// reach this worker. No fence, descriptor reuse or memory merge is deferred.
+// Bound the number of outstanding objects as well as the number of batches;
+// if the worker cannot keep up, use the original synchronous path.
+type RetiredBatch = Vec<(u64, Retired)>;
+static RELEASE_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELEASE_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+static FETCH_COPY_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn join_relay_fetch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_JOIN_FETCH").is_none_or(|v| v != "0"))
+}
+
+fn release_async() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_RELEASE_ASYNC").is_none_or(|v| v != "0"))
+}
+
+fn release_worker() -> Option<&'static std::sync::mpsc::SyncSender<RetiredBatch>> {
+    static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<RetiredBatch>>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (send, receive) = std::sync::mpsc::sync_channel::<RetiredBatch>(2);
+        std::thread::Builder::new().name("victory-release".into()).spawn(move || {
+            while let Ok(batch) = receive.recv() {
+                let n = batch.len() as u64;
+                let start = std::time::Instant::now();
+                drop(batch);
+                RELEASE_STATS[3].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                RELEASE_STATS[4].fetch_add(n, Ordering::Relaxed);
+                RELEASE_PENDING.fetch_sub(n, Ordering::AcqRel);
+            }
+        }).ok()?;
+        Some(send)
+    }).as_ref()
+}
+
+fn bury_relay(finished: u64) {
+    let start = std::time::Instant::now();
+    let done = take_retired(finished);
+    RELEASE_STATS[0].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if done.is_empty() {
+        return;
+    }
+    let n = done.len() as u64;
+    let done = if release_async()
+        && let Some(worker) = release_worker()
+        && RELEASE_PENDING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+            pending.checked_add(n).filter(|&total| total <= 32768)
+        }).is_ok()
+    {
+        match worker.try_send(done) {
+            Ok(()) => {
+                RELEASE_STATS[1].fetch_add(n, Ordering::Relaxed);
+                return;
+            }
+            Err(std::sync::mpsc::TrySendError::Full(batch) | std::sync::mpsc::TrySendError::Disconnected(batch)) => {
+                RELEASE_PENDING.fetch_sub(n, Ordering::AcqRel);
+                batch
+            }
         }
-        retired.drain(..n).collect()
+    } else {
+        done
     };
+    let start = std::time::Instant::now();
     drop(done);
+    RELEASE_STATS[2].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+    RELEASE_STATS[5].fetch_add(n, Ordering::Relaxed);
+}
+
+fn release_line(frames: f64) {
+    let s = RELEASE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "relay release per frame (VICTORY_RELAY_RELEASE_ASYNC={}): {:.2} ms collecting eligible objects, {:.0} queued, {:.2} ms synchronous drops ({} objects), {:.2} ms worker drops ({:.0} objects), {} outstanding; diagnostics {:.2} ms, final line update {:.2} ms",
+        u8::from(release_async()), s[0] / 1000.0, s[1], s[2] / 1000.0, s[5],
+        s[3] / 1000.0, s[4], RELEASE_PENDING.load(Ordering::Acquire), s[6] / 1000.0, s[7] / 1000.0
+    );
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
@@ -3767,6 +3845,11 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    if relay() {
+        release_line(frames);
+        let counts = FETCH_COPY_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!("relay fetch copies per frame (VICTORY_RELAY_JOIN_FETCH={}): {:.0} ranges, {:.0} copy commands", u8::from(join_relay_fetch()), counts[0], counts[1]);
+    }
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4891,9 +4974,33 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
-                    for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                    let mut i = 0;
+                    let mut commands = 0;
+                    while i < copies.len() {
+                        let (shadow, lo, hi, at) = &copies[i];
+                        let mut end = *hi;
+                        let mut next = i + 1;
+                        // Preserve the exact fetch layout and every hash/check
+                        // boundary; only combine adjacent D3D12 copy commands.
+                        if join_relay_fetch() {
+                            while let Some((other, from, to, dest)) = copies.get(next) {
+                                if !std::sync::Arc::ptr_eq(shadow, other)
+                                    || *from != end
+                                    || *dest != *at + (end - *lo) as u64
+                                {
+                                    break;
+                                }
+                                end = *to;
+                                next += 1;
+                            }
+                        }
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (end - *lo) as u64);
+                        i = next;
+                        commands += 1;
                     }
+                    FETCH_COPY_STATS[0].fetch_add(copies.len() as u64, Ordering::Relaxed);
+                    FETCH_COPY_STATS[1].fetch_add(commands, Ordering::Relaxed);
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     let _fetching = crate::timeline::span("landing: fetching pieces");
@@ -5113,12 +5220,15 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_relay(last);
         }
         stage.next("landing: the rest");
+        let diagnostics = std::time::Instant::now();
         self.log_messages();
+        RELEASE_STATS[6].fetch_add(diagnostics.elapsed().as_micros() as u64, Ordering::Relaxed);
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let finalizing = std::time::Instant::now();
         {
             let mut line = line();
             let Line {
@@ -5154,6 +5264,7 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        RELEASE_STATS[7].fetch_add(finalizing.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces

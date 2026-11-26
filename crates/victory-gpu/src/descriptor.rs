@@ -303,6 +303,7 @@ pub(crate) fn sync_heaps() {
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
+    let (mut old_slots_us, mut reads, mut batch_fallbacks) = (0u64, 0u64, 0u64);
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
@@ -322,6 +323,7 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
+        let old_slots = std::time::Instant::now();
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
         crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
@@ -337,6 +339,7 @@ pub(crate) fn sync_heaps() {
         tabled += of_tables;
         mirrored += before.len() as u64 - of_tables;
         kinds[4] += before.len() as u64 - of_tables;
+        old_slots_us += old_slots.elapsed().as_micros() as u64;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
@@ -360,74 +363,95 @@ pub(crate) fn sync_heaps() {
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
+            let mut batch_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
-                // The page's records are read through the kernel, into a
-                // copy: a page the title unmaps meanwhile fails the read
-                // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    continue;
+            let group = parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default();
+            let mut at = 0;
+            while at < group.len() {
+                let first_part = at;
+                let last = if batch_heap_reads() { contiguous_parts(group, at) } else { at + 1 };
+                let base = group[at].0;
+                let mut batched = false;
+                if last > at + 1 {
+                    batch_bytes.resize(group[last - 1].1 - base, 0);
+                    out.reads += 1;
+                    batched = crate::host::read_into(base as *const u8, &mut batch_bytes);
+                    if !batched { out.batch_fallbacks += 1; }
                 }
-                out.pages += 1;
-                out.views += u64::from(crate::watch::guarded(from, to));
-                out.bytes += (to - from) as u64;
-                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                // A record that straddles the range's ends is left
-                // to the range that holds its first byte.
-                let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
-                let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                    continue;
-                };
-                let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
-                out.looked += count;
-                // Only the records that are not the ones last seen
-                // there (`host::Copied::changes`).
-                changed.clear();
-                // SAFETY: the parts are ranges of the heap apart from one
-                // another, and only records that lie whole in one are its.
-                unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
-                for &index in &changed {
-                    let at = (u64::from(index) - first) as usize * step as usize;
-                    let word = |n: usize| {
-                        records
-                            .get(at + 4 * n..at + 4 * n + 4)
-                            .and_then(|b| b.try_into().ok())
-                            .map_or(0, u32::from_le_bytes)
-                    };
-                    if !samplers && word(0) == VIEW_TAG {
-                        // A draw's own table: the draw makes what it
-                        // reads of it (`draw.rs` `tables`).
-                        if host.copied_tabled(index, frame) {
-                            out.tabled += 1;
-                            continue;
-                        }
-                        // Buffer views and placed textures get no host
-                        // slot from this anyway, they wait for a draw
-                        // or a pass: noted some frames on, unless a
-                        // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
-                            out.wait.push(index);
-                            continue;
-                        }
-                    }
-                    // No view, in a slot that shows none: nothing to make or
-                    // unmake (32,000 of 41,000 a frame on the water, run
-                    // b2-water).
-                    if word(0) != VIEW_TAG && host.shows_none(index) {
-                        out.nothing += 1;
-                        continue;
-                    }
-                    out.make.push(index);
-                    out.kinds[if samplers {
-                        3
-                    } else if word(0) != VIEW_TAG {
-                        0
-                    } else if word(2) >> KIND_SHIFT == 0 {
-                        1
+                at = last;
+                for &(from, to) in &group[first_part..last] {
+                    // Keep the original per-page record boundaries. An unmapped
+                    // page in a failed contiguous read must not lose its neighbors.
+                    let page_bytes = if batched {
+                        &batch_bytes[from - base..to - base]
                     } else {
-                        2
-                    }] += 1;
+                        page_bytes.resize(to - from, 0);
+                        out.reads += 1;
+                        if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                            continue;
+                        }
+                        &page_bytes[..]
+                    };
+                    out.pages += 1;
+                    out.views += u64::from(crate::watch::guarded(from, to));
+                    out.bytes += (to - from) as u64;
+                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    // A record that straddles the range's ends is left
+                    // to the range that holds its first byte.
+                    let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                    let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
+                        continue;
+                    };
+                    let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                    out.looked += count;
+                    // Only the records that are not the ones last seen
+                    // there (`host::Copied::changes`).
+                    changed.clear();
+                    // SAFETY: the parts are ranges of the heap apart from one
+                    // another, and only records that lie whole in one are its.
+                    unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                    for &index in &changed {
+                        let at = (u64::from(index) - first) as usize * step as usize;
+                        let word = |n: usize| {
+                            records
+                                .get(at + 4 * n..at + 4 * n + 4)
+                                .and_then(|b| b.try_into().ok())
+                                .map_or(0, u32::from_le_bytes)
+                        };
+                        if !samplers && word(0) == VIEW_TAG {
+                            // A draw's own table: the draw makes what it
+                            // reads of it (`draw.rs` `tables`).
+                            if host.copied_tabled(index, frame) {
+                                out.tabled += 1;
+                                continue;
+                            }
+                            // Buffer views and placed textures get no host
+                            // slot from this anyway, they wait for a draw
+                            // or a pass: noted some frames on, unless a
+                            // draw's table turns out to hold them.
+                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                                out.wait.push(index);
+                                continue;
+                            }
+                        }
+                        // No view, in a slot that shows none: nothing to make or
+                        // unmake (32,000 of 41,000 a frame on the water, run
+                        // b2-water).
+                        if word(0) != VIEW_TAG && host.shows_none(index) {
+                            out.nothing += 1;
+                            continue;
+                        }
+                        out.make.push(index);
+                        out.kinds[if samplers {
+                            3
+                        } else if word(0) != VIEW_TAG {
+                            0
+                        } else if word(2) >> KIND_SHIFT == 0 {
+                            1
+                        } else {
+                            2
+                        }] += 1;
+                    }
                 }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
@@ -435,6 +459,8 @@ pub(crate) fn sync_heaps() {
         drop(copied);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
+            reads += part.reads;
+            batch_fallbacks += part.batch_fallbacks;
             pages += part.pages;
             views += part.views;
             bytes += part.bytes;
@@ -463,6 +489,9 @@ pub(crate) fn sync_heaps() {
     }
     drop(heaps);
     let micros = started.elapsed().as_micros() as u64;
+    for (counter, value) in SYNC_DETAIL.iter().zip([old_slots_us, reads, batch_fallbacks]) {
+        counter.fetch_add(value, Relaxed);
+    }
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
     }
@@ -484,6 +513,8 @@ static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::ato
 #[cfg(windows)]
 #[derive(Default)]
 struct SyncPart {
+    reads: u64,
+    batch_fallbacks: u64,
     pages: u64,
     views: u64,
     bytes: u64,
@@ -498,6 +529,33 @@ struct SyncPart {
 /// Pages [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
 const SYNC_PAGES: usize = 8;
+
+#[cfg(windows)]
+fn batch_heap_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BATCH_READS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+fn contiguous_parts(parts: &[(usize, usize)], first: usize) -> usize {
+    let mut last = first + 1;
+    while last < parts.len() && parts[last - 1].1 == parts[last].0 {
+        last += 1;
+    }
+    last
+}
+
+#[cfg(windows)]
+static SYNC_DETAIL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(all(test, windows))]
+#[test]
+fn heap_batch_does_not_read_through_holes() {
+    let parts = [(0, 64), (64, 128), (192, 256), (256, 320), (400, 440)];
+    assert_eq!(contiguous_parts(&parts, 0), 2);
+    assert_eq!(contiguous_parts(&parts, 2), 4);
+    assert_eq!(contiguous_parts(&parts, 4), 5);
+}
 
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
@@ -534,9 +592,12 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
-    if pages == 0 {
+    let detail = SYNC_DETAIL.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if pages == 0 && detail[0] == 0.0 {
         return;
     }
+    tracing::info!("descriptor sync detail (VICTORY_HEAP_BATCH_READS={}): {:.2} ms processing old waiting slots, {:.1} kernel reads, {:.1} failed batch reads with per-page fallback per frame",
+        u8::from(batch_heap_reads()), detail[0] / 1000.0, detail[1], detail[2]);
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \

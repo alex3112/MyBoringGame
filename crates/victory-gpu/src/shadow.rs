@@ -214,16 +214,39 @@ fn resolve_card_limits(
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
+// A 10-12 GiB local budget has room for a modest extra buffer tier.
+// Keep the existing limit for small buffers and give the extra space to
+// large ones, which dominate snapshot/compare traffic in the prologue.
+// Never move a live buffer: recorded descriptors retain its GPU address.
+fn card_priority() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PRIORITY").is_none_or(|v| v != "0"))
+}
+
+fn priority_cap(size: u64, most: u64, enabled: bool) -> u64 {
+    if enabled && size < 1 << 20 && most >= 768 << 20 {
+        most.saturating_sub((most / 3).min(256 << 20))
+    } else {
+        most
+    }
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let explicit_max = env_mb("VICTORY_CARD_BUFFERS_MB");
+        let (mut min_bytes, mut max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            explicit_max,
         );
+        if card_priority() && !card_all() && explicit_max.is_none()
+            && vram_budget.is_some_and(|budget| ((10u64 << 30)..=(12u64 << 30)).contains(&budget))
+        {
+            max_bytes = max_bytes.max(768 << 20);
+        }
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
@@ -241,6 +264,8 @@ fn card_limits() -> (u64, u64) {
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
+            large_buffer_priority = card_priority() && !card_all(),
+            small_buffer_cap_mb = priority_cap(64 << 10, max_bytes, card_priority() && !card_all()) >> 20,
             "card buffer limits"
         );
         (min_bytes, max_bytes)
@@ -422,8 +447,19 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    let cap = priority_cap(size, most, card_priority() && !card_all());
+    if CARD_BYTES[0].fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        used.checked_add(size).filter(|&total| total <= cap)
+    }).is_err() {
+        // Do not charge a small buffer refused by the reserved large-buffer
+        // tier against the texture reservation for those large buffers.
+        static REFUSED: AtomicU64 = AtomicU64::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 32 || n.is_multiple_of(128) {
+            tracing::info!(size_kib = size >> 10, cap_mb = cap >> 20,
+                used_mb = CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                refused = n, "card buffer allocation refused by size-tier cap");
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -5748,6 +5784,15 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    #[test]
+    fn large_buffers_have_the_reserved_tier_without_exceeding_the_limit() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(super::priority_cap(64 << 10, 768 * MIB, true), 512 * MIB);
+        assert_eq!(super::priority_cap(MIB, 768 * MIB, true), 768 * MIB);
+        assert_eq!(super::priority_cap(64 << 10, 512 * MIB, true), 512 * MIB);
+        assert_eq!(super::priority_cap(64 << 10, 768 * MIB, false), 768 * MIB);
     }
 
     /// An ask that may take any window takes the longest that holds all of
