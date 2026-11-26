@@ -227,6 +227,7 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
 struct Aside {
+    device: ID3D12Device,
     queue: ID3D12CommandQueue,
     list: ID3D12CommandList,
     fence: ID3D12Fence,
@@ -237,6 +238,13 @@ struct Aside {
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
 // thread at a time (the lock).
 unsafe impl Send for Aside {}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        // SAFETY: this is the event owned exclusively by this Aside.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.event) };
+    }
+}
 
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
@@ -253,6 +261,10 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
+        // A queue/fence belongs to its device, including in the WARP device tests.
+        if aside.as_ref().is_some_and(|a| a.device.as_raw() != device.as_raw()) {
+            *aside = None;
+        }
         if aside.is_none() {
             let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
                 let mut made: Option<ID3D12Resource> = None;
@@ -286,6 +298,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             list.CopyBufferRegion(&to, 0, &from, 0, 16);
             list.Close()?;
             *aside = Some(Aside {
+                device: device.clone(),
                 queue,
                 list: list.cast()?,
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
@@ -300,8 +313,13 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
             a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+            if WaitForSingleObject(a.event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                return Err(windows::core::Error::from_win32());
+            }
         }
+        // A removed device signals fences with UINT64_MAX; that is not a
+        // successful residency wait. Never publish memory on that path.
+        device.GetDeviceRemovedReason()?;
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
