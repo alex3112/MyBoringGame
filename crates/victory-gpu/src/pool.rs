@@ -673,6 +673,23 @@ mod tests {
     }
 
     #[test]
+    fn small_blocks_reclaim_by_their_own_capacity() {
+        let mut pool = Pool::with_size(1, 8 << 20);
+        let (a, _, _) = pool.take(4 << 20, 512, 0, || Some(1)).unwrap();
+        let (b, _, _) = pool.take(4 << 20, 512, 0, || Some(2)).unwrap();
+        assert_eq!(a.block, b.block);
+        assert_ne!(a.start, b.start);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.take((4 << 20) + 512, 512, 0, || Some(3)).is_none());
+        pool.give(a, 0);
+        pool.give(b, 0);
+        pool.reclaim(REST - 1, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);

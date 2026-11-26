@@ -7146,8 +7146,11 @@ impl HostList {
             }
         }
         if s.current == s.chunks.len() {
-            let mut size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
-                SCRATCH_FIRST
+            // Descriptor-held constants frequently occupy only a few KiB.
+            // Their dedicated buffers must not reserve 4 MiB on the second
+            // small request, nor 256 KiB for the first 64 KiB or less.
+            let mut size = if scratch_pool() && len <= SCRATCH_FIRST && (held || s.chunks.is_empty()) {
+                len.next_power_of_two().clamp(64 << 10, SCRATCH_FIRST)
             } else {
                 SCRATCH_CHUNK
             };
