@@ -1298,21 +1298,40 @@ fn snapshots_kept() -> usize {
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let limit = crate::residency::cache_limit(512 << 20, 128 << 20) as usize;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
-        total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
-            break;
-        }
-        kept += 1;
-    }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
+    let gone = trim_snapshot_pool(&mut pool, limit);
     drop(pool);
+    drop(gone);
+}
+
+/// The budget is strict, including the first (possibly very large) buffer.
+fn trim_snapshot_pool(pool: &mut Vec<Vec<u8>>, limit: usize) -> Vec<Vec<u8>> {
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut total = 0usize;
+    let mut count = 0usize;
+    let mut gone = Vec::new();
+    pool.retain_mut(|v| {
+        if count < snapshots_kept() && v.capacity() <= limit.saturating_sub(total) {
+            total += v.capacity();
+            count += 1;
+            true
+        } else {
+            gone.push(std::mem::take(v));
+            false
+        }
+    });
+    gone
+}
+
+/// Reclaim idle snapshots even if no new snapshot was returned this frame.
+pub(crate) fn trim_snapshots() {
+    let limit = crate::residency::cache_limit(512 << 20, 128 << 20) as usize;
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        trim_snapshot_pool(&mut pool, limit)
+    };
     drop(gone);
 }
 
@@ -2539,9 +2558,10 @@ static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// memory in 27 s; kept snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
+    let normal = *MOST.get_or_init(|| {
         std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
-    })
+    });
+    crate::residency::cache_limit(normal, 64 << 20)
 }
 
 /// The 64 KiB pieces, cut at multiples of 64 KiB of title memory, that
@@ -3382,8 +3402,12 @@ impl Shadow {
                     KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
                 }
             }
-            if kept.1 {
+            if kept.1 && KEPT_BYTES.load(Ordering::Relaxed) <= kept_most() {
                 return;
+            }
+            if kept.1 {
+                kept.1 = false;
+                KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
             }
             // Given back: nothing of it is current next time. (The lock
             // on the pieces ends here: `copy_back` takes it while it holds
@@ -5040,21 +5064,21 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
-/// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
+/// (256 KiB on compact hosts) unless `VICTORY_WINDOW_KB` overrides it.
 /// A window is the PC's memory, all of it, however little of it is read:
 /// 803 windows held 3.3 GB in run 60's gameplay, and all that was ever
 /// asked for in them lay within 1.6 GB. On a grid of 1 MiB or 256 KiB a
 /// window ends nearer to what is read. An ask without a length keeps the
 /// 4 MiB grid whatever is set: a root view reads from its address to its
 /// window's end, and mesh streams bound that way reach megabytes.
-/// shortcut: the default stays 4 MiB until a run with the memory line's
-/// window counts has shown what the finer grids give; the same memory
-/// asked for with different ranges then lies in more than one window.
+/// Sized requests can use smaller windows; unsized requests preserve the
+/// original extent. Different overlapping descriptor ranges can still
+/// require separate copies.
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        grid(kb.or_else(|| crate::residency::compact_host().then_some(256)))
     })
 }
 

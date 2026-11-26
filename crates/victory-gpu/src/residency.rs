@@ -18,6 +18,8 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
@@ -51,6 +53,8 @@ fn sample_commit(now: u64) -> u64 {
         && let Some(status) = memory_status()
     {
         AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        AVAILABLE_PHYSICAL.store(status.ullAvailPhys, Ordering::Relaxed);
+        HEADROOM.store(status.ullAvailPhys.min(status.ullAvailPageFile), Ordering::Relaxed);
     }
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
@@ -76,7 +80,9 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    has_upload_reserve(commit, bake)
+        && (bake || AVAILABLE_PHYSICAL.load(Ordering::Relaxed) >= 512 * MIB)
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -87,12 +93,42 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    let commit = sample_commit(now);
+    has_growth_reserve(commit, bake)
+        && (bake || AVAILABLE_PHYSICAL.load(Ordering::Relaxed) >= GIB)
 }
 
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+}
+
+/// Smaller hosts need proactive cache limits, even with a large pagefile.
+pub(crate) fn compact_host() -> bool {
+    static COMPACT: OnceLock<bool> = OnceLock::new();
+    *COMPACT.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 24 * GIB))
+}
+
+/// Maximum optional texture budget as a share of the live DXGI budget.
+pub(crate) fn texture_percent(configured: u64) -> u64 {
+    let cap = if pressured() { 80 } else if compact_host() { 85 } else { 97 };
+    configured.min(cap)
+}
+
+/// Limit idle caches, not snapshots still required by submitted work.
+pub(crate) fn cache_limit(normal: u64, compact: u64) -> u64 {
+    if pressured() {
+        0
+    } else if compact_host() {
+        normal.min(compact)
+    } else {
+        normal
+    }
+}
+
+pub(crate) fn critical_memory() -> bool {
+    let _ = sample_commit(crate::host::coarse_ms());
+    critical_commit() || AVAILABLE_PHYSICAL.load(Ordering::Relaxed) < GIB
 }
 
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
@@ -108,8 +144,32 @@ pub(crate) fn refresh() {
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
+    AVAILABLE_PHYSICAL.store(physical, Ordering::Relaxed);
+    AVAILABLE_COMMIT.store(commit, Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    // Enter at 4 GiB free on a compact host, recover at 6 GiB.
+    let pressure = next_pressure(was, physical.saturating_sub(if compact_host() { GIB } else { 0 }), commit);
+    let now = crate::host::coarse_ms();
+    let last = LAST_REPORT.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 5000
+        && LAST_REPORT.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        let video = crate::host::host().and_then(|h| h.video_memory()).unwrap_or([0; 4]);
+        tracing::info!(
+            frame = crate::frame::current(),
+            physical_free_mib = physical >> 20,
+            available_commit_mib = commit >> 20,
+            local_budget_mib = video[0] >> 20,
+            local_used_mib = video[1] >> 20,
+            shared_used_mib = video[3] >> 20,
+            buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+            texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
+            spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
+            tiled_gpu_texture_mib = crate::tiles::given_total() >> 20,
+            pressure,
+            "memory budget sample (MiB)"
+        );
+    }
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -122,6 +182,7 @@ pub(crate) fn refresh() {
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
+                tiled_gpu_texture_mib = crate::tiles::given_total() >> 20,
                 "host memory pressure: limiting texture prefetch and idle upload storage"
             );
         } else {

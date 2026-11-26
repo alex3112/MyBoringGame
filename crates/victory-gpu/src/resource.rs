@@ -1685,8 +1685,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = limit {
-        return filled < limit;
+    if limit.is_some_and(|limit| filled >= limit) {
+        return false;
+    }
+    let percent = crate::residency::texture_percent(room_percent());
+    // An explicit cache limit and the minimum texture floor must not bypass
+    // real DXGI headroom, especially when system RAM is already pressured.
+    if let Some([budget, used, ..]) = memory {
+        if budget != 0 && used >= budget / 100 * percent {
+            return false;
+        }
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
@@ -1699,7 +1707,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // used.
         Some([budget, used, ..]) => {
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+                < budget / 100 * percent
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2041,7 +2049,18 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            if crate::residency::compact_host() || crate::residency::pressured() {
+                let percent = crate::residency::texture_percent(room_percent());
+                let trigger = budget / 100 * percent;
+                let target = budget / 100 * percent.saturating_sub(3);
+                if budget != 0 && used >= trigger {
+                    (5_000, used.saturating_sub(target))
+                } else {
+                    crate::host::vram_keep(budget, used)
+                }
+            } else {
+                crate::host::vram_keep(budget, used)
+            }
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };

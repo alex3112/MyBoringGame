@@ -394,7 +394,8 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
+    let idle = ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram());
+    if crate::residency::pressured() { idle.min(2_000) } else if crate::residency::compact_host() { idle.min(5_000) } else { idle }
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -449,7 +450,8 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    let interval = if crate::residency::pressured() || crate::residency::compact_host() { 500 } else { 1000 };
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -465,6 +467,7 @@ fn sweep() {
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::tiles::sweep();
     crate::pipeline::trim_library();
+    crate::shadow::trim_snapshots();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -1956,6 +1959,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 } else {
                     SPARE_MOST
                 };
+                let limit = crate::residency::cache_limit(limit, 64 << 20);
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
