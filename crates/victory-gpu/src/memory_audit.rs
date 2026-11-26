@@ -72,6 +72,8 @@ const NAMES: &[&str] = &[
     "title_virtual_commit_call_bytes_cumulative", "title_virtual_free_call_bytes_cumulative", "title_virtual_free_calls_cumulative",
     "native_list_pool_idle_count", "thin_backend_pool_idle_count", "native_list_lazy_acquired_cumulative",
     "native_list_lazy_detached_cumulative", "native_list_pool_hits_cumulative",
+    "partial_mip_copies_created_cumulative", "partial_mip_native_bytes_created_cumulative",
+    "partial_mip_copies_grown_cumulative", "partial_mip_title_full_span_bytes_cumulative",
 ];
 
 fn sample(start: Instant) -> Vec<Option<u64>> {
@@ -109,6 +111,7 @@ fn sample(start: Instant) -> Vec<Option<u64>> {
         VIRTUAL_FREE_CALL_BYTES.load(Relaxed), VIRTUAL_FREE_CALLS.load(Relaxed)
     ].map(Some));
     row.extend(crate::list::audit());
+    row.extend(crate::resource::HELD.iter().map(|n| Some(n.load(Relaxed))));
     for (_, meter) in METERS { row.extend(meter.sample().map(Some)); }
     row
 }

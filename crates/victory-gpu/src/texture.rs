@@ -744,6 +744,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if host_written {
         return;
     }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // A reserved texture's tile judgement uses the complete mip chain.
+    // Ordinary copies may stage only the held levels.
+    let first = if copy.tiled.is_some() { 0 } else { first };
     // Once a list for each first level; not again for one that the list's
     // upload of larger ones held too.
     if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
@@ -752,9 +758,6 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
-    let Some(copy) = crate::resource::host_copy(resource) else {
-        return;
-    };
     let texture = &copy.texture;
     ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
@@ -832,7 +835,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     if no_wait() && fill_unlocked() {
         let there = match picking {
-            Some(there) if there != u64::MAX => there,
+            Some(there) if there != u64::MAX && !staging.on_demand => there.min(staging.read as u64),
             _ => mapped_bytes(staging.memory, staging.read),
         };
         staging.expected.store(there, Relaxed);
@@ -1835,9 +1838,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
+    // Use the exact copy this upload targets, not a second lookup which
+    // might see a replacement. A tiled copy always stages all levels.
+    let on_demand = copy.tiled.is_some();
+    let first = if on_demand { 0 } else { first };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))

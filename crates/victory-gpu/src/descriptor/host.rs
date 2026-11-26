@@ -1537,7 +1537,27 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
-        let (heap, count, size) = if null == 0 {
+        // All translated shaders (including cached ones) clamp sampler
+        // indices to 2047, not to the title's current heap size. Allocate
+        // the complete addressable range and keep count as the logical
+        // title count, so padding cannot be used as title-owned slots.
+        let (heap, count, size) = if sampler {
+            const SAMPLER_SLOTS: u32 = 2048;
+            let fitted = count.min(SAMPLER_SLOTS);
+            if fitted != count {
+                tracing::warn!(count, "title sampler heap exceeds native limit");
+            }
+            match make(SAMPLER_SLOTS) {
+                Ok(heap) => {
+                    tracing::info!(title_slots = fitted, native_slots = SAMPLER_SLOTS, "host sampler heap padded to shader index limit");
+                    (heap, fitted, SAMPLER_SLOTS)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, "no padded host sampler heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -1647,7 +1667,12 @@ impl HostHeap {
         // null instead.
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
-            tracing::warn!(error = %e, "host descriptor heap not made null");
+            tracing::warn!(error = %e, sampler, "host descriptor heap not made null");
+            // Do not publish a sampler heap with undefined padding that
+            // translated shaders are allowed to read.
+            if sampler {
+                return None;
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -1656,14 +1681,16 @@ impl HostHeap {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
-        const BLOCK: u32 = 1 << 16;
+        // A sampler staging heap needs only the actual 2048 entries, not
+        // the 65536-entry block used to fill the much larger view heaps.
+        let block_slots = total.min(1 << 16).max(1);
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_slots,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -1685,13 +1712,13 @@ impl HostHeap {
                     null_view(start);
                 }
                 let mut filled = 1;
-                while filled < BLOCK {
-                    let n = filled.min(BLOCK - filled);
+                while filled < block_slots {
+                    let n = filled.min(block_slots - filled);
                     host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                     filled += n;
                 }
                 while done < end {
-                    let n = BLOCK.min(end - done);
+                    let n = block_slots.min(end - done);
                     host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                     done += n;
                 }

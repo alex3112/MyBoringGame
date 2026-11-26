@@ -1240,7 +1240,7 @@ struct Hosted {
 pub(crate) fn held_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0") && !crate::tiles::wanted()
+        std::env::var_os("VICTORY_HELD_LEVELS").is_none_or(|v| v != "0")
     })
 }
 
@@ -1297,7 +1297,9 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
 }
 
 /// The bytes of title memory a placed texture with the resource description
-/// `desc` is read from for a view that starts at level `first`; `None` as
+/// `desc` is read from for a view that starts at level `first`. This is a
+/// view-span estimate; reserved tiled copies still stage the entire chain.
+/// `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
@@ -1578,7 +1580,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        // A successfully reserved tiled texture keeps its complete native
+        // mip numbering. Only the ordinary fallback can start at a later
+        // mip. Enabling the tiled feature must not disable this fallback.
+        if tiled.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
