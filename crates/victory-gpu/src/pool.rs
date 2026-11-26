@@ -61,6 +61,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+    for pool in [&STAGING_SMALL, &SCRATCH_PAGES] {
+        if let Ok(mut pool) = pool.try_lock() {
+            pool.reclaim(tick, if pressure { 0 } else { 1 }, true);
+        }
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -199,11 +204,16 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    block_size: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Self::with_size(most, BLOCK)
+    }
+
+    const fn with_size(most: usize, block_size: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, block_size }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -224,7 +234,7 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block_size } else { self.block_size / 2 } {
             return None;
         }
         self.rested(now);
@@ -262,7 +272,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block_size)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -294,7 +304,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(self.block_size), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -316,7 +326,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block_size);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -325,7 +335,7 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(self.block_size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -348,6 +358,49 @@ unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+const SMALL_STAGE: u64 = 8 << 20;
+const SCRATCH_PAGE: u64 = 1 << 20;
+static STAGING_SMALL: Mutex<Pool<Upload>> = Mutex::new(Pool::with_size(1, SMALL_STAGE));
+static SCRATCH_PAGES: Mutex<Pool<Upload>> = Mutex::new(Pool::with_size(2, SCRATCH_PAGE));
+pub(crate) static UPLOAD_REUSE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+// Scratch slices taken, logical scratch bytes taken, small staging slices, bytes.
+
+/// Only for list-private scratch: the owner returns the slice after the
+/// existing native-list fence/reset protocol, never while a descriptor
+/// can still refer to it. No texture quarantine is needed here.
+pub(crate) struct ScratchPiece(Piece);
+impl Drop for ScratchPiece {
+    fn drop(&mut self) {
+        let mut pool = lock(&SCRATCH_PAGES);
+        if let Some(block) = pool.blocks[self.0.block].as_mut() {
+            block.free.give(self.0.start, self.0.len);
+        }
+    }
+}
+
+pub(crate) fn scratch(host: &crate::host::Host, bytes: u64) -> Option<(ScratchPiece, ID3D12Resource, u64, *mut u8)> {
+    let (piece, memory, _) = lock(&SCRATCH_PAGES).take(bytes, 256, now(), || {
+        let (buffer, data) = host.upload_buffer(SCRATCH_PAGE)?;
+        crate::host::name(&buffer, || "shared list-private scratch page".into());
+        Some(Upload(buffer, data))
+    })?;
+    UPLOAD_REUSE[0].fetch_add(1, Ordering::Relaxed);
+    UPLOAD_REUSE[1].fetch_add(bytes, Ordering::Relaxed);
+    // SAFETY: the exclusively leased range within the mapped page.
+    let data = unsafe { memory.1.add(piece.start as usize) };
+    Some((ScratchPiece(piece), memory.0, piece.start, data))
+}
+
+pub(crate) fn upload_audit() -> [Option<u64>; 6] {
+    [
+        SCRATCH_PAGES.try_lock().ok().map(|p| p.blocks() as u64 * SCRATCH_PAGE),
+        STAGING_SMALL.try_lock().ok().map(|p| p.blocks() as u64 * SMALL_STAGE),
+        Some(UPLOAD_REUSE[0].load(Ordering::Relaxed)),
+        Some(UPLOAD_REUSE[1].load(Ordering::Relaxed)),
+        Some(UPLOAD_REUSE[2].load(Ordering::Relaxed)),
+        Some(UPLOAD_REUSE[3].load(Ordering::Relaxed)),
+    ]
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -365,23 +418,23 @@ pub(crate) fn texture_room() -> u64 {
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), (lock(&STAGING).blocks() as u64 * BLOCK + lock(&STAGING_SMALL).blocks() as u64 * SMALL_STAGE) >> 20]
 }
 
 /// Physical block capacity; the logical pieces are a subset, not additive.
 pub(crate) fn audit() -> [Option<u64>; 2] {
     [
         TEXTURES.try_lock().ok().map(|p| p.blocks() as u64 * BLOCK),
-        STAGING.try_lock().ok().map(|p| p.blocks() as u64 * BLOCK),
+        STAGING.try_lock().ok().and_then(|p| STAGING_SMALL.try_lock().ok().map(|q| p.blocks() as u64 * BLOCK + q.blocks() as u64 * SMALL_STAGE)),
     ]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
-pub(crate) struct StagingPiece(Piece);
+pub(crate) struct StagingPiece(Piece, bool);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        lock(if self.1 { &STAGING_SMALL } else { &STAGING }).give(self.0, now());
     }
 }
 
@@ -393,7 +446,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let small = bytes <= SMALL_STAGE / 2;
+    let (pool, capacity) = if small { (&STAGING_SMALL, SMALL_STAGE) } else { (&STAGING, BLOCK) };
+    let (piece, memory, again) = lock(pool).take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -401,11 +456,15 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         if speculative && !crate::residency::allow_staging_growth(false) {
             return None;
         }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.upload_buffer(capacity)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
-    let owned = StagingPiece(piece);
+    let owned = StagingPiece(piece, small);
+    if small {
+        UPLOAD_REUSE[2].fetch_add(1, Ordering::Relaxed);
+        UPLOAD_REUSE[3].fetch_add(bytes, Ordering::Relaxed);
+    }
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
     if again {
@@ -747,7 +806,7 @@ mod tests {
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
-            lock(&STAGING).rested(u64::MAX);
+            lock(&STAGING_SMALL).rested(u64::MAX);
             let (_piece, _, _, data) = staging(host, 4096).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.

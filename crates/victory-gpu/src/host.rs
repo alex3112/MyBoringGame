@@ -1181,6 +1181,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    // Descriptor-held constants cannot share slices whose lifetime ends at reset.
+    held_scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -1840,6 +1842,8 @@ impl Drop for Counted {
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    base: u64,
+    slice: Option<crate::pool::ScratchPiece>,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -1945,7 +1949,14 @@ fn take_chunk_with_growth(host: &Host, size: u64, grow: bool) -> Option<Chunk> {
     Some(Chunk {
         buffer,
         data: data as usize,
+        base: 0,
+        slice: None,
     })
+}
+
+fn private_scratch_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    let (slice, buffer, base, data) = crate::pool::scratch(host, size)?;
+    Some(Chunk { buffer, data: data as usize, base, slice: Some(slice) })
 }
 
 /// A list is done with `chunks` (it was reset after its submissions ran,
@@ -1959,7 +1970,13 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
+            if chunk.slice.is_some() {
+                // The slice owns its return to the page pool; do not cache
+                // it again in the dedicated resource pool or count it twice.
+                freed.push(chunk);
+                continue;
+            }
+            let back = if scratch_pool() && references(&chunk.buffer) == 1 {
                 let limit = if keep_freed() && !crate::residency::limited_host_ram() {
                     SPARE_KEPT
                 } else {
@@ -3415,6 +3432,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// Readback storage is reserved early and reused after each fetch fence.
 /// Large landings are split, not backed by a second, larger allocation.
 const RELAY_FETCH_BYTES: u64 = 16 << 20;
+pub(crate) static ZERO_REUSE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 pub(crate) static MEMORY_REUSE: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 // fetch capacity, batches, bytes, optional scratch growth avoided,
@@ -4132,6 +4150,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                held_scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6432,6 +6451,11 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            let mut scratch = self.held_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (scratch.current, scratch.used) = (0, 0);
+            give_chunks(std::mem::take(&mut scratch.chunks));
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7046,10 +7070,42 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// Immutable zero-filled upload data is identical for every list. The
+    /// cache holds one resource; recordings retain older generations until
+    /// their fences complete. No shared writable scratch or guest pages.
+    pub(crate) fn zero_upload(&self, host: &Host, size: u64) -> Option<ID3D12Resource> {
+        const MAX: u64 = 16 << 20;
+        static ZERO: Mutex<Option<(u64, ID3D12Resource)>> = Mutex::new(None);
+        if size == 0 || size == u64::MAX { return None; }
+        if size <= MAX {
+            let mut zero = ZERO.lock().unwrap_or_else(|e| e.into_inner());
+            if zero.as_ref().is_none_or(|(cap, _)| *cap < size) {
+                let cap = size.next_power_of_two().max(64 << 10);
+                if let Some((buffer, data)) = host.upload_buffer(cap) {
+                    // SAFETY: the new private mapping, before it is published.
+                    unsafe { std::ptr::write_bytes(data, 0, cap as usize) };
+                    name(&buffer, || "immutable zero upload".into());
+                    ZERO_REUSE[0].store(cap, Ordering::Relaxed);
+                    *zero = Some((cap, buffer));
+                }
+            }
+            if let Some((cap, buffer)) = zero.as_ref() && *cap >= size {
+                self.keep(buffer);
+                ZERO_REUSE[1].fetch_add(1, Ordering::Relaxed);
+                ZERO_REUSE[2].fetch_add(size, Ordering::Relaxed);
+                return Some(buffer.clone());
+            }
+        }
+        let (buffer, data) = self.upload(host, size)?;
+        // SAFETY: the list owns the mapped range.
+        unsafe { std::ptr::write_bytes(data, 0, size as usize) };
+        Some(buffer)
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.scratch_at(len, false)?;
         // SAFETY: a live buffer.
         Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
     }
@@ -7057,7 +7113,7 @@ impl HostList {
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.scratch_at(len, true)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
         Some((buffer, gpu, data))
@@ -7065,9 +7121,9 @@ impl HostList {
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
     /// pointer.
-    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    fn scratch_at(&self, len: u64, held: bool) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = if held { &self.held_scratch } else { &self.scratch }.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
@@ -7079,6 +7135,15 @@ impl HostList {
         // next one (a list's first chunk may be a small one).
         while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            if !held && scratch_pool() && len <= SCRATCH_FIRST {
+                let size = len.next_power_of_two().clamp(64 << 10, SCRATCH_FIRST);
+                if let Some(chunk) = private_scratch_chunk(host, size) {
+                    s.chunks.push((chunk, size));
+                    s.used = 0;
+                }
+            }
         }
         if s.current == s.chunks.len() {
             let mut size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
@@ -7112,17 +7177,20 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
+        let chunk = &s.chunks[s.current].0;
+        let (data, buffer, base) = (chunk.data, chunk.buffer.clone(), chunk.base);
         let at = s.used;
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some((buffer, base + at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        scratch.chunks.iter().map(|c| c.1).sum()
+        let private: u64 = scratch.chunks.iter().map(|c| c.1).sum();
+        let held = self.held_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        private + held.chunks.iter().map(|c| c.1).sum::<u64>()
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
