@@ -84,6 +84,10 @@ const NAMES: &[&str] = &[
     "submit_refresh_coverage_skips_cumulative", "submit_refresh_coverage_bytes_cumulative",
     "journal_clean_blocks_cumulative", "journal_clean_block_bytes_cumulative",
     "journal_ahead_pass_skips_cumulative", "journal_ahead_range_skips_cumulative",
+    "snapshot_new_allocations_cumulative", "snapshot_pool_hits_cumulative",
+    "snapshot_pool_reused_capacity_bytes_cumulative", "snapshot_sparse_reservations_cumulative",
+    "snapshot_sparse_reserved_span_bytes_cumulative", "snapshot_sparse_committed_bytes_cumulative",
+    "snapshot_actual_copy_bytes_cumulative", "snapshot_fully_covered_declarations_cumulative",
 ];
 
 fn sample(start: Instant) -> Vec<Option<u64>> {
@@ -128,6 +132,7 @@ fn sample(start: Instant) -> Vec<Option<u64>> {
     row.extend(crate::host::ZERO_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     row.extend(crate::host::REFRESH_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     row.extend(crate::watch::JOURNAL_REUSE.iter().map(|n| Some(n.load(Relaxed))));
+    row.extend(crate::shadow::SNAPSHOT_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     for (_, meter) in METERS { row.extend(meter.sample().map(Some)); }
     row
 }

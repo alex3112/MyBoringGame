@@ -61,7 +61,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: Mutex<Option<Snapshot>>,
     /// Held shared while pieces of the copy are landed (`crate::land`), each
     /// its own bytes of it on several threads, and alone while title bytes
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
@@ -1257,27 +1257,135 @@ mod relay_tests {
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<Vec<Snapshot>> = Mutex::new(Vec::new());
 
-/// An empty buffer with room for `n` bytes, from the pool if it has one
-/// of about that size: a small copy's snapshot took the 174 MB buffer kept
-/// for the big heap's, which then got another, until eight of them were
-/// reserved (1.4 GB in run 24).
-fn pooled(n: usize) -> Vec<u8> {
+pub(crate) static SNAPSHOT_REUSE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+// New snapshots, reused snapshots, reused capacity, sparse reservations,
+// sparse address span, sparse committed bytes, actual bytes snapshotted,
+// declarations completely covered by pending ranges.
+
+/// A sparse snapshot has the same stable address arithmetic as the dense
+/// one. Reserve the complete logical span, but commit only pages actually
+/// named by shader writes. Never move or decommit live storage: landing and
+/// the wide copy workers can retain its address after dropping the lock.
+struct SparseSnapshot {
+    base: usize,
+    span: usize,
+    committed: usize,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl SparseSnapshot {
+    fn new(n: usize) -> Option<Self> {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
+        let span = n.checked_add(PAGE - 1)? / PAGE * PAGE;
+        // SAFETY: reserves an address range, with no committed pages yet.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), span, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        if base == 0 { return None; }
+        SNAPSHOT_REUSE[3].fetch_add(1, Ordering::Relaxed);
+        SNAPSHOT_REUSE[4].fetch_add(span as u64, Ordering::Relaxed);
+        Some(Self { base, span, committed: 0, ranges: Vec::new() })
+    }
+
+    fn ensure(&mut self, from: usize, to: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
+        if from >= to { return 0; }
+        assert!(to <= self.span);
+        let lo = from / PAGE * PAGE;
+        let hi = to.div_ceil(PAGE) * PAGE;
+        let covered: usize = self.ranges.iter().map(|&(a, b)| b.min(hi).saturating_sub(a.max(lo))).sum();
+        let added = (hi - lo).saturating_sub(covered);
+        if added == 0 { return 0; }
+        // Committing already committed pages does not reset them. In
+        // particular a partial-page declaration preserves older bytes.
+        let result = unsafe { VirtualAlloc((self.base + lo) as *const _, hi - lo, MEM_COMMIT, PAGE_READWRITE) };
+        if result.is_null() {
+            crate::host::fail(format_args!("could not commit sparse snapshot pages ({added} bytes)"));
+        }
+        let mut merged = (lo, hi);
+        self.ranges.retain(|&(a, b)| {
+            if a <= merged.1 && merged.0 <= b {
+                merged = (merged.0.min(a), merged.1.max(b));
+                false
+            } else { true }
+        });
+        self.ranges.push(merged);
+        self.committed += added;
+        SNAPSHOT_REUSE[5].fetch_add(added as u64, Ordering::Relaxed);
+        added
+    }
+}
+
+impl Drop for SparseSnapshot {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        // SAFETY: original reservation, no worker still holds its address.
+        unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+enum Snapshot {
+    Dense(Vec<u8>),
+    Sparse(SparseSnapshot),
+}
+
+impl Default for Snapshot {
+    fn default() -> Self { Self::Dense(Vec::new()) }
+}
+
+impl Snapshot {
+    fn new(n: usize, needed: usize) -> Self {
+        // Sparse reservations pay only for genuinely sparse large copies.
+        // Dense snapshots keep the cheaper existing allocator for small or
+        // mostly covered copies. A reservation failure can still use it.
+        if n >= 4 << 20 && needed <= n / 4
+            && let Some(sparse) = SparseSnapshot::new(n)
+        {
+            return Self::Sparse(sparse);
+        }
+        Self::Dense(Vec::with_capacity(n))
+    }
+    fn span(&self) -> usize {
+        match self { Self::Dense(v) => v.capacity(), Self::Sparse(v) => v.span }
+    }
+    /// Committed capacity, not the sparse address reservation.
+    fn capacity(&self) -> usize {
+        match self { Self::Dense(v) => v.capacity(), Self::Sparse(v) => v.committed }
+    }
+    fn as_ptr(&self) -> *const u8 {
+        match self { Self::Dense(v) => v.as_ptr(), Self::Sparse(v) => v.base as *const u8 }
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self { Self::Dense(v) => v.as_mut_ptr(), Self::Sparse(v) => v.base as *mut u8 }
+    }
+    fn ensure(&mut self, from: usize, to: usize) {
+        if let Self::Sparse(v) = self {
+            let added = v.ensure(from, to);
+            if added != 0 {
+                crate::memory_audit::SNAPSHOT.add(added as u64);
+            }
+        }
+    }
+}
+
+/// A reusable allocation with room for the original logical span.
+fn pooled(n: usize, needed: usize) -> Snapshot {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
+    let fit = pool.iter().enumerate()
+        .filter(|(_, v)| v.span() >= n && v.span() <= most)
+        .min_by_key(|(_, v)| (v.span(), v.capacity()))
         .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    if let Some(i) = fit {
+        let v = pool.swap_remove(i);
+        SNAPSHOT_REUSE[1].fetch_add(1, Ordering::Relaxed);
+        SNAPSHOT_REUSE[2].fetch_add(v.capacity() as u64, Ordering::Relaxed);
+        return v;
+    }
+    // Do not hold the pool lock during a kernel allocation.
+    drop(pool);
+    SNAPSHOT_REUSE[0].fetch_add(1, Ordering::Relaxed);
+    Snapshot::new(n, needed)
 }
 
 /// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
@@ -1297,8 +1405,18 @@ fn snapshots_kept() -> usize {
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
-fn give_back(v: Vec<u8>) {
-    let limit = crate::residency::cache_limit(512 << 20, 128 << 20) as usize;
+fn snapshot_pool_limit() -> usize {
+    if crate::residency::critical_memory() { return 0; }
+    if crate::residency::pressured() {
+        // A small hot working set avoids freeing every allocation on
+        // hosts which have pressure but still have physical headroom.
+        return 16 << 20;
+    }
+    crate::residency::cache_limit(512 << 20, 128 << 20) as usize
+}
+
+fn give_back(v: Snapshot) {
+    let limit = snapshot_pool_limit();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     let gone = trim_snapshot_pool(&mut pool, limit);
@@ -1307,8 +1425,15 @@ fn give_back(v: Vec<u8>) {
 }
 
 /// The budget is strict, including the first (possibly very large) buffer.
-fn trim_snapshot_pool(pool: &mut Vec<Vec<u8>>, limit: usize) -> Vec<Vec<u8>> {
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+fn trim_snapshot_pool(pool: &mut Vec<Snapshot>, limit: usize) -> Vec<Snapshot> {
+    if limit == 0 { return std::mem::take(pool); }
+    // Under pressure favour reusable small buffers rather than a single
+    // large allocation taking the entire hot cache.
+    if limit <= 16 << 20 {
+        pool.sort_by_key(|v| v.capacity());
+    } else {
+        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    }
     let mut total = 0usize;
     let mut count = 0usize;
     let mut gone = Vec::new();
@@ -1327,12 +1452,49 @@ fn trim_snapshot_pool(pool: &mut Vec<Vec<u8>>, limit: usize) -> Vec<Vec<u8>> {
 
 /// Reclaim idle snapshots even if no new snapshot was returned this frame.
 pub(crate) fn trim_snapshots() {
-    let limit = crate::residency::cache_limit(512 << 20, 128 << 20) as usize;
+    let limit = snapshot_pool_limit();
     let gone = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         trim_snapshot_pool(&mut pool, limit)
     };
     drop(gone);
+}
+
+/// Keep the same ordered fragments as the old rebuilding loop.
+fn subtract_pending(parts: &mut Vec<(usize, usize)>, a: usize, e: usize) {
+    if a >= e { return; }
+    let mut i = 0;
+    while i < parts.len() {
+        let (from, to) = parts[i];
+        if e <= from || a >= to {
+            i += 1;
+        } else if from < a && e < to {
+            parts[i] = (from, a);
+            parts.insert(i + 1, (e, to));
+            i += 2;
+        } else if from < a {
+            parts[i] = (from, a);
+            i += 1;
+        } else if e < to {
+            parts[i] = (e, to);
+            i += 1;
+        } else {
+            parts.remove(i);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn snapshot_subtraction_preserves_uncovered_bytes() {
+    let mut p = vec![(0, 100)];
+    subtract_pending(&mut p, 20, 40);
+    subtract_pending(&mut p, 60, 80);
+    assert_eq!(p, [(0, 20), (40, 60), (80, 100)]);
+    subtract_pending(&mut p, 10, 90);
+    assert_eq!(p, [(0, 10), (90, 100)]);
+    subtract_pending(&mut p, 0, 100);
+    assert!(p.is_empty());
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3114,31 +3276,26 @@ impl Shadow {
         let mut parts = vec![self.inside(address, len)];
         for &(a, e) in pending.iter() {
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
-                if e <= from || a >= to {
-                    rest.push((from, to));
-                    continue;
-                }
-                if from < a {
-                    rest.push((from, a));
-                }
-                if e < to {
-                    rest.push((e, to));
-                }
-            }
-            parts = rest;
+            // Subtract in place rather than allocating another Vec for
+            // every pending range (thousands of overlapping declarations).
+            subtract_pending(&mut parts, a, e);
+            if parts.is_empty() { break; }
         }
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        if taken == 0 {
+            SNAPSHOT_REUSE[7].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| {
-            let bytes = pooled(total);
+            let bytes = pooled(total, taken);
             crate::memory_audit::SNAPSHOT.add(bytes.capacity() as u64);
             bytes
         });
+        for &(from, to) in &parts { snapshot.ensure(from, to); }
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
             // piece the part holds whole is current from now on; of a
@@ -3165,11 +3322,13 @@ impl Shadow {
                     unsafe {
                         std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
+                    SNAPSHOT_REUSE[6].fetch_add((hi - lo) as u64, Ordering::Relaxed);
                     kept.0[piece] = whole;
                 }
             }
             return;
         }
+        SNAPSHOT_REUSE[6].fetch_add(taken as u64, Ordering::Relaxed);
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
             // its refreshes are done (`take_snapshots`): the range is
@@ -4216,7 +4375,8 @@ impl Shadow {
             // refresh writes; the lock keeps the landing out.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
         } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            // SAFETY: the snapshot's allocation holds the copy's length.
+            snapshot.ensure(from, to);
+            // SAFETY: the snapshot has committed storage for this range.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
         }
         self.changed(from, to);
@@ -4584,7 +4744,7 @@ impl Shadow {
         crate::land::spent(crate::land::stat::LOCK, waiting);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
-        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
+        let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Snapshot::as_mut_ptr) else {
             return 0;
         };
         // SAFETY: inside the copy's mapping (checked above), which only the
