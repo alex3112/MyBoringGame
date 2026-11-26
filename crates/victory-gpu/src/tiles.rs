@@ -133,6 +133,9 @@ pub(crate) fn given_total() -> u64 {
 struct Heap {
     heap: ID3D12Heap,
     free: Vec<(u32, u32)>,
+    // Returned tiles are not reusable until the same grace period as the
+    // ordinary texture pool has elapsed.
+    resting: Vec<(u64, u32, u32)>,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
@@ -158,6 +161,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    reclaim(&mut pool, false);
     let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
     let index = match found {
         Some(index) => index,
@@ -190,6 +194,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             let fresh = Heap {
                 heap,
                 free: vec![(0, HEAP_TILES)],
+                resting: Vec::new(),
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -221,31 +226,63 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     Some((h.heap.clone(), index, runs))
 }
 
-/// Gives the runs `runs` of the pool's heap at `index` back; runs that
-/// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
+/// Return runs to the quarantine rather than immediately reusing their
+/// backing memory. The ordinary placed texture pool uses the same grace
+/// period; stale bindless accesses must not see memory recycled at once.
 fn give_back(index: usize, runs: &[(u32, u32)]) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
         return;
     };
-    h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
+    let ready = crate::host::now_ms().saturating_add(crate::pool::REST);
+    h.resting.extend(runs.iter().map(|&(start, count)| (ready, start, count)));
+}
+
+/// Called under POOL. Reclaim only mature runs; a heap is wholly free
+/// only when no live or quarantined tiles remain. During allocation leave
+/// free heaps available for reuse; during the periodic sweep trim spares.
+fn reclaim(pool: &mut [Option<Heap>], trim: bool) {
+    let now = crate::host::now_ms();
+    let mut spare = 0;
+    for entry in pool {
+        let Some(h) = entry.as_mut() else { continue };
+        let mut matured = false;
+        let free = &mut h.free;
+        h.resting.retain(|&(ready, start, count)| {
+            if ready <= now {
+                free.push((start, count));
+                matured = true;
+                false
+            } else {
+                true
+            }
+        });
+        if matured {
+            h.free.sort_unstable();
+            let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
+            for &(from, tiles) in &h.free {
+                match joined.last_mut() {
+                    Some(last) if last.0 + last.1 == from => last.1 += tiles,
+                    _ => joined.push((from, tiles)),
+                }
+            }
+            h.free = joined;
+        }
+        if trim && h.resting.is_empty() && h.free_tiles() == HEAP_TILES {
+            spare += 1;
+            if spare > 1 {
+                *entry = None;
+                STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+                STATS[8].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
-        pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-        STATS[8].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reap quarantined tiles even when no new textures are being allocated.
+pub(crate) fn sweep() {
+    if let Ok(mut pool) = POOL.try_lock() {
+        reclaim(&mut pool, true);
     }
 }
 

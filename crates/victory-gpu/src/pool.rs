@@ -73,7 +73,7 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// Milliseconds until a piece given back is used again. (It was three
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
-const REST: u64 = 2500;
+pub(crate) const REST: u64 = 2500;
 
 fn now() -> u64 {
     crate::host::now_ms()

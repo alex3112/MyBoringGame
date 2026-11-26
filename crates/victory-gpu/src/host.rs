@@ -463,6 +463,7 @@ fn sweep() {
         trim_spare_chunks();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::tiles::sweep();
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1687,13 +1688,13 @@ pub(crate) fn dred_on() -> bool {
 }
 
 /// Breadcrumbs and the faulting address, but no markers and no texts
-/// (`VICTORY_D3D12_DRED=light`): which list a removed device stopped in, at
+/// (`VICTORY_D3D12_DRED=light`, default in diagnostics builds): which list a removed device stopped in, at
 /// which of its commands, and the pipelines the list binds; formatting a text
 /// for every command is what makes the whole of it slow.
 pub(crate) fn dred_light() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "light")
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_none_or(|v| v == "light")
     })
 }
 

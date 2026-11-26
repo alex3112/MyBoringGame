@@ -2117,7 +2117,10 @@ pub(crate) fn let_go_idle() {
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
             went += 1;
-            bytes += host.bytes;
+            // Reserved textures have zero committed bytes in HostTexture;
+            // count their actual backing tiles towards the sweep's limit.
+            // KINDS[3] deliberately keeps its original committed-byte accounting.
+            bytes += host.tiled.as_ref().map_or(host.bytes, |tiles| tiles.given_bytes());
             if first.is_none() {
                 first = Some(at);
             }
