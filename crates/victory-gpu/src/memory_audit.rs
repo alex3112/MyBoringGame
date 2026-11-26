@@ -74,6 +74,9 @@ const NAMES: &[&str] = &[
     "native_list_lazy_detached_cumulative", "native_list_pool_hits_cumulative",
     "partial_mip_copies_created_cumulative", "partial_mip_native_bytes_created_cumulative",
     "partial_mip_copies_grown_cumulative", "partial_mip_title_full_span_bytes_cumulative",
+    "window_reuse_requests_cumulative", "window_reuse_span_bytes_cumulative",
+    "relay_fetch_capacity_bytes", "relay_fetch_batches_cumulative", "relay_fetch_bytes_cumulative",
+    "scratch_growth_fallbacks_cumulative", "upload_allocation_failures_cumulative", "shared_allocation_failures_cumulative",
 ];
 
 fn sample(start: Instant) -> Vec<Option<u64>> {
@@ -112,6 +115,8 @@ fn sample(start: Instant) -> Vec<Option<u64>> {
     ].map(Some));
     row.extend(crate::list::audit());
     row.extend(crate::resource::HELD.iter().map(|n| Some(n.load(Relaxed))));
+    row.extend(crate::shadow::WINDOW_REUSE.iter().map(|n| Some(n.load(Relaxed))));
+    row.extend(crate::host::MEMORY_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     for (_, meter) in METERS { row.extend(meter.sample().map(Some)); }
     row
 }

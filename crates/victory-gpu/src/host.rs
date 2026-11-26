@@ -1923,6 +1923,10 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    take_chunk_with_growth(host, size, true)
+}
+
+fn take_chunk_with_growth(host: &Host, size: u64, grow: bool) -> Option<Chunk> {
     if scratch_pool()
         && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
     {
@@ -1930,6 +1934,9 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
+    }
+    if !grow {
+        return None;
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
@@ -3405,6 +3412,14 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// What the thread that lands flights fetches card copies' pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
 /// behind the submission lock), and the memory the pieces come down to.
+/// Readback storage is reserved early and reused after each fetch fence.
+/// Large landings are split, not backed by a second, larger allocation.
+const RELAY_FETCH_BYTES: u64 = 16 << 20;
+pub(crate) static MEMORY_REUSE: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+// fetch capacity, batches, bytes, optional scratch growth avoided,
+// upload allocation failures, shared allocation failures.
+
 struct RelayFetch {
     list: Prelude,
     /// With [`relay_copy`]: the card's copy queue, which `list` is for.
@@ -4593,13 +4608,20 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
+            let buffer = [RELAY_FETCH_BYTES, 4 << 20, 1 << 20].into_iter().find_map(|size| {
+                self.shared_buffer(size).map(|(buffer, data)| {
+                    name(&buffer, || "reusable relay readback".into());
+                    MEMORY_REUSE[0].store(size, Ordering::Relaxed);
+                    (buffer, data as usize, size)
+                })
+            });
             Some(RelayFetch {
                 list,
                 queue,
                 fence,
                 event,
                 sent: 0,
-                buffer: None,
+                buffer,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
             })
@@ -4704,13 +4726,6 @@ impl Host {
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
-        // On the copy queue a later flight may be at a piece while it is
-        // fetched: the pieces come down whole, to be hashed.
-        let check = (torn::on() && fetch.as_ref().is_some_and(|f| f.queue.is_some()))
-            .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
-        if let Some(check) = &check {
-            total = check.total;
-        }
         #[cfg(feature = "diagnostics")]
         for (shadow, lo, hi, _) in &pieces {
             traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
@@ -4731,133 +4746,177 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
-        if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+        // If the early reservation failed, try the smallest buffer once
+        // more. Never replace or grow a valid buffer under memory pressure.
+        if f.buffer.is_none() {
+            f.buffer = self.shared_buffer(1 << 20).map(|(buffer, data)| {
+                MEMORY_REUSE[0].store(1 << 20, Ordering::Relaxed);
+                (buffer, data as usize, 1 << 20)
+            });
         }
-        let Some((buffer, data, _)) = f.buffer.clone() else {
-            fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
+        let Some((buffer, data, capacity)) = f.buffer.clone() else {
+            fail(format_args!("no reusable relay fetch buffer (minimum 1 MiB, {total} bytes requested)"));
         };
-        f.sent += 1;
-        let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let copy_queue = f.queue.clone();
-        let waiting = std::time::Instant::now();
-        // The flights the fetch runs behind: those in the line by now have
-        // been given to the queue. On the copy queue, those landed here.
-        let ahead = match copy_queue {
-            Some(_) => 0,
-            None => line().target,
-        };
-        // SAFETY: the list's last run was waited for by this thread; live
-        // buffers (the copies are held by the plans); the fence and the
-        // event are this thread's.
-        let ran = unsafe {
-            (|| -> windows::core::Result<u64> {
-                allocator.Reset()?;
-                list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                }
-                list.Close()?;
-                let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                let _fetching = crate::timeline::span("landing: fetching pieces");
-                if let Some(queue) = &copy_queue {
-                    queue.ExecuteCommandLists(&lists);
-                    queue.Signal(&fence, sent)?;
+        let check_on = torn::on() && f.queue.is_some();
+        let mut first = 0;
+        let mut after_all = u64::MAX;
+        while first < pieces.len() {
+            let mut last = first;
+            let mut charged = 0;
+            // Each piece lies in a single 64 KiB title block. If checking
+            // hashes, charge the whole native hash span, including alignment,
+            // even where several partial pieces share one fetch.
+            while last < pieces.len() {
+                let (shadow, lo, hi, _) = &pieces[last];
+                let bytes = if check_on {
+                    let (from, to) = shadow.card_hashed(shadow.card_piece_of(*lo));
+                    (to - from) as u64
+                } else {
+                    (*hi - *lo) as u64
+                };
+                if charged + bytes > capacity { break; }
+                charged += bytes;
+                last += 1;
+            }
+            if last == first {
+                fail(format_args!("one relay piece exceeds the reusable fetch buffer"));
+            }
+            let mut batch = pieces[first..last].to_vec();
+            let mut total = 0u64;
+            for (_, lo, hi, at) in &mut batch {
+                *at = total;
+                total += (*hi - *lo) as u64;
+            }
+            let mut pieces = batch;
+            let check = check_on.then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
+            if let Some(check) = &check { total = check.total; }
+            assert!(total <= capacity);
+            MEMORY_REUSE[1].fetch_add(1, Ordering::Relaxed);
+            MEMORY_REUSE[2].fetch_add(total, Ordering::Relaxed);
+            let f = fetch.as_mut().expect("relay fetch exists");
+            f.sent += 1;
+            let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+            let copy_queue = f.queue.clone();
+            let waiting = std::time::Instant::now();
+            // The flights the fetch runs behind: those in the line by now have
+            // been given to the queue. On the copy queue, those landed here.
+            let ahead = match copy_queue {
+                Some(_) => 0,
+                None => line().target,
+            };
+            // SAFETY: the list's last run was waited for by this thread; live
+            // buffers (the copies are held by the plans); the fence and the
+            // event are this thread's.
+            let ran = unsafe {
+                (|| -> windows::core::Result<u64> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                    let _fetching = crate::timeline::span("landing: fetching pieces");
+                    if let Some(queue) = &copy_queue {
+                        queue.ExecuteCommandLists(&lists);
+                        queue.Signal(&fence, sent)?;
+                        meanwhile();
+                        fence.SetEventOnCompletion(sent, event)?;
+                        #[cfg(feature = "diagnostics")]
+                        let _card = crate::timeline::card_wait(None);
+                        WaitForSingleObject(event, INFINITE);
+                        return Ok(behind);
+                    }
+                    // In the order of the queue: the sends of title bytes so
+                    // far are ahead of this fetch, every later one behind it.
+                    let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                    self.queue.ExecuteCommandLists(&lists);
+                    let after = *order;
+                    drop(order);
+                    self.card_sent();
+                    self.queue.Signal(&fence, sent)?;
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
                     #[cfg(feature = "diagnostics")]
                     let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
-                    return Ok(behind);
-                }
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
-                meanwhile();
-                fence.SetEventOnCompletion(sent, event)?;
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
-                Ok(after)
-            })()
-        };
-        let after = match ran {
-            Ok(after) => after,
-            Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
-        };
-        let us = waiting.elapsed().as_micros() as u64;
-        RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
-        {
-            use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
-            CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
-            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
-        }
-        let merging = std::time::Instant::now();
-        let _merging = crate::timeline::span("landing: merging fetched pieces");
-        let mut written = 0;
-        if land::on() {
-            let titles: Vec<(usize, usize)> =
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
-            let put = std::sync::atomic::AtomicU64::new(0);
-            land::each(jobs.len(), &|j| {
-                let working = std::time::Instant::now();
-                if let Some(check) = &check {
-                    for i in jobs[j].clone() {
+                    Ok(after)
+                })()
+            };
+            let after = match ran {
+                Ok(after) => after,
+                Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
+            };
+            let us = waiting.elapsed().as_micros() as u64;
+            RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+            {
+                use crate::shadow::CARD_STATS;
+                CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+                CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+                CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            }
+            let merging = std::time::Instant::now();
+            let _merging = crate::timeline::span("landing: merging fetched pieces");
+            let mut written = 0;
+            if land::on() {
+                let titles: Vec<(usize, usize)> =
+                    pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+                let jobs = land::jobs(&titles);
+                let put = std::sync::atomic::AtomicU64::new(0);
+                land::each(jobs.len(), &|j| {
+                    let working = std::time::Instant::now();
+                    if let Some(check) = &check {
+                        for i in jobs[j].clone() {
+                            // SAFETY: as below.
+                            unsafe { check.look(i, data) };
+                        }
+                    }
+                    let mut notes = land::Notes::default();
+                    for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+                        let addressed: Vec<(usize, usize, usize)> =
+                            run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+                        // SAFETY: the mapping of the fetched bytes, `total` of
+                        // them; the copy into it has run, and the next waits
+                        // for this call.
+                        put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                    }
+                    notes.flush();
+                    land::spent(land::stat::CARD_ALL, working);
+                });
+                land::count(land::stat::JOBS, jobs.len() as u64);
+                written = put.into_inner();
+            } else {
+                let mut title = Vec::new();
+                for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+                    if let Some(check) = &check {
                         // SAFETY: as below.
                         unsafe { check.look(i, data) };
                     }
+                    // SAFETY: the mapping of the fetched bytes, `total` of them;
+                    // the copy into it has run.
+                    let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                    let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                    shadow.walls_merged(gpu.len(), merged);
+                    written += merged as u64;
                 }
-                let mut notes = land::Notes::default();
-                for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
-                }
-                notes.flush();
-                land::spent(land::stat::CARD_ALL, working);
-            });
-            land::count(land::stat::JOBS, jobs.len() as u64);
-            written = put.into_inner();
-        } else {
-            let mut title = Vec::new();
-            for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
+            }
+            land::spent(land::stat::CARD, merging);
+            COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            if let Some(f) = fetch.as_mut() {
                 if let Some(check) = &check {
-                    // SAFETY: as below.
-                    unsafe { check.look(i, data) };
+                    check.done(&mut f.suspects);
                 }
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                written += merged as u64;
+                f.had.fetched(
+                    ahead,
+                    pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
+                );
             }
+            // Keep the send history until every batch has been merged.
+            after_all = after_all.min(after);
+            first = last;
         }
-        land::spent(land::stat::CARD, merging);
-        COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
-        if let Some(f) = fetch.as_mut() {
-            if let Some(check) = &check {
-                check.done(&mut f.suspects);
-            }
-            f.had.fetched(
-                ahead,
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
-            );
-        }
-        // Sends up to `after` are of no use to any later merge.
-        crate::shadow::relay_fetched(after);
+        crate::shadow::relay_fetched(after_all);
     }
 
     /// [`relay`], on the thread that lands flights: `items` are the first
@@ -7008,12 +7067,34 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
+            let mut size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
                 SCRATCH_FIRST
             } else {
                 SCRATCH_CHUNK
             };
-            let chunk = take_chunk(host, size)?;
+            // A 4 MiB growth failure must not make a small constant upload
+            // fail. Try smaller buckets down to the actual request. Failed
+            // speculative growth sizes cool down across lists, but the
+            // smallest sufficient allocation is always attempted.
+            static RETRY: [std::sync::atomic::AtomicU64; 7] =
+                [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+            let minimum = len.next_power_of_two().max(64 << 10);
+            let chunk = loop {
+                let slot = (size.trailing_zeros() - 16) as usize;
+                let now = coarse_ms();
+                let grow = size == minimum || now >= RETRY[slot].load(Ordering::Relaxed);
+                if let Some(chunk) = take_chunk_with_growth(host, size, grow) {
+                    break chunk;
+                }
+                if size == minimum {
+                    return None;
+                }
+                MEMORY_REUSE[3].fetch_add(1, Ordering::Relaxed);
+                if grow {
+                    RETRY[slot].fetch_max(now.saturating_add(500), Ordering::Relaxed);
+                }
+                size /= 2;
+            };
             s.chunks.push((chunk, size));
             s.used = 0;
         }
@@ -8640,6 +8721,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                MEMORY_REUSE[4].fetch_add(1, Ordering::Relaxed);
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
@@ -9528,6 +9610,8 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                MEMORY_REUSE[5].fetch_add(1, Ordering::Relaxed);
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }

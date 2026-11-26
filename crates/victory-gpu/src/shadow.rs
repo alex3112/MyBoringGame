@@ -2850,7 +2850,12 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<_> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner())
+                .retain(|_, key| map.contains_key(key));
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -5291,6 +5296,31 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+/// A descriptor's later refresh must find the same allocation as its creation.
+/// Store only keys, not another Arc (which would prevent the ordinary sweep).
+/// Always lock LOOSE first, including during removal.
+type WindowKey = (u64, u64);
+static WINDOW_ALIASES: Mutex<BTreeMap<(WindowKey, bool), WindowKey>> = Mutex::new(BTreeMap::new());
+pub(crate) static WINDOW_REUSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A sized request can share a containing window. Unsized views must also
+/// preserve their original upper bound because shaders can read to its end.
+fn containing_window(
+    keys: impl Iterator<Item = WindowKey>, wanted: WindowKey, unsized: bool,
+) -> Option<WindowKey> {
+    let end = wanted.0.checked_add(wanted.1)?;
+    keys.filter(|&(start, bytes)| {
+        start <= wanted.0 && start.checked_add(bytes).is_some_and(|last| {
+            last >= end && (!unsized || last == end)
+        })
+    }).min_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
+}
+
+fn reused_window(shadow: &Shadow, named: WindowKey) {
+    WINDOW_REUSE[0].fetch_add(1, Ordering::Relaxed);
+    WINDOW_REUSE[1].fetch_add(named.1.min(shadow.len), Ordering::Relaxed);
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -5311,6 +5341,18 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // Resolve a stable alias before an exact key: the latter may have been
+    // created by a different kind of request after a descriptor was made.
+    if !tails() {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).get(&(named, unsized_ask))
+            && let Some(shadow) = map.get(key)
+        {
+            note(shadow);
+            reused_window(shadow, named);
+            return Some(shadow.clone());
+        }
+    }
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -5320,6 +5362,37 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    if !tails() {
+        let mut aliases = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = aliases.get(&(named, unsized_ask))
+            && let Some(shadow) = map.get(key)
+        {
+            note(shadow);
+            reused_window(shadow, named);
+            return Some(shadow.clone());
+        }
+        // The exact name wins if already allocated. Otherwise reuse an
+        // existing containing allocation, even one starting in an earlier
+        // cell. Transient draw requests need only their actual range.
+        let wanted = if any && !unsized_ask { (address, end - address) } else { named };
+        let key = if map.contains_key(&named) {
+            Some(named)
+        } else {
+            containing_window(map.range(..=(wanted.0, u64::MAX)).map(|(key, _)| *key), wanted, unsized_ask)
+        };
+        if let Some(key) = key
+            && let Some(shadow) = map.get(&key)
+        {
+            if key != named {
+                if !any {
+                    aliases.insert((named, unsized_ask), key);
+                }
+                reused_window(shadow, named);
+            }
+            note(shadow);
+            return Some(shadow.clone());
+        }
+    }
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
@@ -5599,6 +5672,15 @@ mod window_tests {
 
     /// A window holds its ask and is cut on the grid; on the default grid
     /// it is the window there always was.
+    #[test]
+    fn containing_windows_preserve_unsized_end_and_choose_smallest() {
+        let keys = [(0, 8 << 20), (4 << 20, 2 << 20), (5 << 20, 3 << 20)];
+        assert_eq!(super::containing_window(keys.into_iter(), (5 << 20, 1 << 20), false), Some(keys[1]));
+        assert_eq!(super::containing_window(keys.into_iter(), (5 << 20, 3 << 20), true), Some(keys[2]));
+        assert_eq!(super::containing_window(keys.into_iter(), (5 << 20, 512 << 10), true), None);
+        assert_eq!(super::containing_window(keys.into_iter(), (7 << 20, 2 << 20), false), None);
+    }
+
     #[test]
     fn windows_hold_their_ask_on_the_grid() {
         let (address, end) = (0xd_1234_5678u64, 0xd_1234_5678u64 + 0x9000);
