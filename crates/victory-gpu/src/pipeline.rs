@@ -223,7 +223,8 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let mut tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    tables.raw_table_constants = host.raw_table_constants;
     Ok(Translated {
         host,
         threads,

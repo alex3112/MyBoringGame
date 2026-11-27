@@ -53,6 +53,7 @@ pub(crate) struct Lowered {
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
+    pub raw_table_constants: bool,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
@@ -301,6 +302,8 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    raw_table_constants: bool,
+    heap_cbv: bool,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
@@ -1682,6 +1685,8 @@ impl<'a> Lower<'a> {
                 m
             },
             handles: HashMap::new(),
+            raw_table_constants: false,
+            heap_cbv: false,
             strides: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -2443,6 +2448,7 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
+            raw_table_constants: self.raw_table_constants && !self.heap_cbv,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -6118,6 +6124,22 @@ impl<'a> Lower<'a> {
         out
     }
 
+    /// Only statically identified table CBVs; ambiguous and root
+    /// descriptors retain CBV lowering.
+    fn raw_table_constant(&self, src: &Source) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if super::shader::raw_views() == 0
+            || !*ON.get_or_init(|| std::env::var_os("VICTORY_RAW_TABLE_CONSTANTS").is_none_or(|v| v != "0"))
+        { return false; }
+        let Some((param, byte)) = self.entry(src) else { return false; };
+        let Some(root) = self.x.native.layout.get(param) else { return false; };
+        root.root == RootType::Table && byte.is_multiple_of(32)
+            && self.x.native.used.iter().any(|u| {
+                u.root == RootType::Table && u.user_data == root.user_data
+                    && u.table_offset_dwords == byte / 4 && u.kind == ResourceType::Cbv
+            })
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -6285,6 +6307,14 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if self.raw_table_constant(src) {
+            self.raw_table_constants = true;
+            let h = self.handle(site, src, false, (11, 0))?;
+            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7197,6 +7227,9 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        if props.0 & 0xFF == 13 && !matches!(src, Source::Built { .. }) {
+            self.heap_cbv = true;
+        }
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);
@@ -11710,7 +11743,9 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.raw_table_constant(src);
+            self.raw_table_constants |= raw;
+            let h = self.handle(site, src, false, if raw { (11, 0) } else { (13, 0x1_0000) })?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11722,11 +11757,17 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            if raw {
+                for (k, x) in self.raw_dwords(h, byte, count).into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            } else {
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let x = self.cbuffer_dword(h, a);
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
             }
             return Ok(());
         }

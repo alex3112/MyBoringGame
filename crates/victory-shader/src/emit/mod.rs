@@ -346,6 +346,8 @@ pub struct HostShader {
     /// Root CBVs the shader reads: root parameter indices, each bound as
     /// `b<index>` in [`ROOT_CBV_SPACE`].
     pub root_cbvs: Vec<u8>,
+    /// All heap CBV reads in this translated stage use the raw twin.
+    pub raw_table_constants: bool,
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
@@ -891,6 +893,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        raw_table_constants: l.raw_table_constants,
     };
     Ok((shader, wave_size))
 }
@@ -1672,6 +1675,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            raw_table_constants: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1684,6 +1688,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                raw_table_constants: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -2293,6 +2298,7 @@ mod tests {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            raw_table_constants: false,
             root_indexed_views: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2446,6 +2452,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                raw_table_constants: false,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2862,6 +2869,7 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            raw_table_constants: false,
             root_indexed_views: Vec::new(),
         };
         validate(&vs);

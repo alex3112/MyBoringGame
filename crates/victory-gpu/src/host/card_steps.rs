@@ -119,7 +119,7 @@ const MOST: usize = 12288;
 pub(super) enum FillTo {
     /// A descriptor slot that shows the fill's memory, and nothing else does
     /// (title heap, slot): it is made to show our buffer instead.
-    Slot(usize, u32),
+    Slot(usize, u32, bool),
     /// A buffer the card can write, filled from its beginning.
     Buffer(ID3D12Resource),
 }
@@ -532,13 +532,14 @@ struct Op {
     at: u64,
     level: u32,
     to: To,
+    direct: bool,
 }
 
 enum To {
     /// A host copy, and the title address.
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
-    Slot(usize, u32),
+    Slot(usize, u32, bool),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
 }
@@ -556,6 +557,21 @@ fn record(
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
+    // Keep GPU ordering even for a submission with only direct fills.
+    if reads.is_empty() && writes.is_empty() {
+        if first {
+            unsafe { list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]); }
+        }
+        return;
+    }
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -718,6 +734,7 @@ impl Host {
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
         let mut end = 0u64;
+        let direct_writes = direct_constants().then(|| submission_writes(runs));
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -734,22 +751,6 @@ impl Host {
                     let from = holder(&writers, src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
-                }
-            };
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
-                None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
-                    if !mapped(src, src + len, &mut room) {
-                        return Err("not all of what it reads is mapped");
-                    }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
                 }
             };
             let to = match does[i] {
@@ -773,10 +774,36 @@ impl Host {
                     To::Copy(to, dst)
                 }
                 _ => match fill_to(runs, steps[i]) {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                    Some(FillTo::Slot(heap, index, raw_only)) => To::Slot(heap, index, raw_only),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
                 },
+            };
+            let direct = if let To::Slot(_, _, raw_only) = &to {
+                DIRECT[0].fetch_add(1, Ordering::Relaxed);
+                direct_writes.as_ref().is_some_and(|writes| can_direct(&from, src, len, *raw_only, writes))
+            } else { false };
+            if direct && !mapped(src, src + len, &mut room) {
+                return Err("not all of what a direct constant reads is mapped");
+            }
+            let at = if direct { 0 } else {
+                let place = (Arc::as_ptr(&from) as usize, src, len, level);
+                let at = match places.get(&place) {
+                    Some(&at) => at,
+                    None => {
+                        if end + len as u64 > BETWEEN {
+                            return Err("too much at once");
+                        }
+                        if !mapped(src, src + len, &mut room) {
+                            return Err("not all of what it reads is mapped");
+                        }
+                        let at = end;
+                        end = (end + len as u64).next_multiple_of(256);
+                        places.insert(place, at);
+                        at
+                    }
+                };
+                at
             };
             ops.push(Op {
                 from: (from, src),
@@ -784,6 +811,7 @@ impl Host {
                 at,
                 level,
                 to,
+                direct,
             });
         }
         spent.next("steps on the card: the list");
@@ -821,7 +849,7 @@ impl Host {
         for level in 0..=levels {
             let mut reads = Vec::new();
             let mut writes = Vec::new();
-            for op in ops.iter().filter(|op| op.level == level) {
+            for op in ops.iter().filter(|op| op.level == level && !op.direct) {
                 let len = op.len as u64;
                 let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
                 // (Each place once.)
@@ -846,11 +874,24 @@ impl Host {
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
             for op in &ops {
-                if let To::Slot(heap, index) = &op.to
+                if let To::Slot(heap, index, raw_only) = &op.to
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    if op.direct {
+                        let source = &op.from.0;
+                        if *raw_only {
+                            crate::descriptor::raw_constant_slot(*heap, *index, &source.buffer,
+                                source.offset(op.from.1 as u64), op.len as u32);
+                        } else {
+                            crate::descriptor::constant_slot(*heap, *index, &source.buffer,
+                                source.gpu(op.from.1 as u64), op.len as u32);
+                        }
+                        DIRECT[if *raw_only { 1 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+                        DIRECT[3].fetch_add(op.len as u64, Ordering::Relaxed);
+                    } else {
+                        crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    }
                 }
             }
         });
@@ -904,11 +945,75 @@ fn noted(ops: &[Op]) {
     }
 }
 
+static DIRECT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn direct_constants() -> bool { crate::toggled!("VICTORY_GPU_RESIDENT_CONSTANTS") }
+
+/// A live direct binding cannot replace a snapshot if any preparation
+/// step or GPU command in the submission can change the source bytes.
+fn submission_writes(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut writes = Vec::new();
+    for list in runs {
+        let d = list.deferred();
+        for step in &d.copies {
+            let span = match step {
+                Step::GpuWrite(_, at, len) | Step::Copy(at, _, len) =>
+                    (*at, at.saturating_add(*len)),
+                Step::Placed(p) => (p.dst, p.dst.saturating_add(p.len)),
+                _ => continue,
+            };
+            if span.0 < span.1 { writes.push(span); }
+        }
+        for &(at, _, len) in &d.writes { writes.push((at, at.saturating_add(len))); }
+        for &(_, at, [row, rows, pitch]) in &d.backs {
+            writes.push((at, at.saturating_add(rows.saturating_sub(1).saturating_mul(pitch)).saturating_add(row)));
+        }
+    }
+    let mut joined = Vec::new();
+    join_ranges(&mut joined, writes);
+    joined
+}
+
+fn direct_alignment(offset: u64, len: u64, raw: bool) -> bool {
+    len != 0 && len <= 65536 && if raw {
+        offset.is_multiple_of(16) && len.is_multiple_of(4)
+    } else {
+        offset.is_multiple_of(256) && len.is_multiple_of(256)
+    }
+}
+
+fn can_direct(shadow: &Shadow, src: usize, len: usize, raw: bool, writes: &[(usize, usize)]) -> bool {
+    let Some(end) = src.checked_add(len) else { return false; };
+    if !shadow.card_local() || shadow.in_place()
+        || !direct_alignment(shadow.offset(src as u64), len as u64, raw)
+        || shadow.left(src as u64) < len as u64
+        || shadow.offset(src as u64).saturating_add(len as u64) > shadow.width()
+        || touches(writes, src, end)
+    { return false; }
+    // Physical page aliases can be written under a different address.
+    use crate::inplace::Cover;
+    crate::inplace::cover(src, len) == Cover::None
+        && crate::inplace::cover(end - 1, 1) == Cover::None
+}
+
+#[cfg(test)]
+#[test]
+fn resident_constant_alignment() {
+    assert!(direct_alignment(16, 480, true));
+    assert!(!direct_alignment(16, 480, false));
+    assert!(direct_alignment(256, 512, false));
+    assert!(!direct_alignment(8, 480, true));
+    assert!(!direct_alignment(0, 65540, true));
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
     }
+    let [candidates, raw, cbv, bytes] = DIRECT.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("GPU resident constants per frame (VICTORY_GPU_RESIDENT_CONSTANTS={}): {:.0} candidates, {:.0} direct raw, {:.0} direct CBV, {:.2} KiB intermediate copies omitted",
+        u8::from(direct_constants()), candidates, raw, cbv, bytes / 1024.0);
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \

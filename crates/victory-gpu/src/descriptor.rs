@@ -747,6 +747,21 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// Rebind a dynamic table slot whose consumer uses only its raw twin.
+#[cfg(windows)]
+pub(crate) fn raw_constant_slot(
+    heap: usize, index: u32,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    offset: u64, size: u32,
+) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(_, _, h)| h == heap)
+        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+    {
+        host.raw_constant_at(index, buffer, offset, size);
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

@@ -3498,6 +3498,35 @@ impl HostHeap {
         self.keep_ref(index, holds.then_some(buffer));
     }
 
+    /// A raw-only table slot: its primary CBV is null and its raw
+    /// twin names exactly the 16-byte aligned source range.
+    pub(crate) fn raw_constant_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, size: u32) {
+        let (Some(host), Some(twin)) = (host(), self.twin(index)) else { return; };
+        debug_assert!(offset.is_multiple_of(16) && size.is_multiple_of(4) && size != 0);
+        let null = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: size / 4,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&null), self.at(index));
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.put(index);
+        self.twin_made(index, true);
+        self.write_stride(index, 0);
+        self.keep_ref(index, Some(buffer));
+    }
+
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
     /// a slot of this thread's in a heap the card does not see
     /// ([`staged`]), or the slot itself.

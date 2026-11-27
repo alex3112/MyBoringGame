@@ -4462,6 +4462,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// The shader-visible buffer has dedicated GPU memory.
+    pub(crate) fn card_local(&self) -> bool {
+        self.card.as_ref().is_some_and(|card| card.local)
+    }
+
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {

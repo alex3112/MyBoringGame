@@ -60,6 +60,7 @@ pub(crate) fn bind_line(frames: f64) {
 
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
+    pub(crate) raw_table_constants: bool,
     groups: Vec<TableGroup>,
     // Direct entries can interleave slots. Preserve their declaration order
     // when recording resource reads, writes, and transitions.
@@ -117,7 +118,7 @@ impl TablePlan {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
         }
-        Self { groups, direct }
+        Self { groups, direct, raw_table_constants: false }
     }
 }
 
@@ -493,7 +494,7 @@ pub(crate) struct State {
     host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64, bool), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -3934,6 +3935,8 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // Separate raw-only tables from stages that need the primary CBV.
+            let raw_only = plan.raw_table_constants && group.has_cbv && group.indexed.is_empty();
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
@@ -3942,7 +3945,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                (table, n, h.0, raw_only)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -4106,7 +4109,7 @@ impl State {
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
-                        list.defer_constants(to, address as *const u8, size as usize, slot);
+                        list.defer_constants(to, address as *const u8, size as usize, slot, raw_only);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
