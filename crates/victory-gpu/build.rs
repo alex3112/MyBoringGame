@@ -15,7 +15,11 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[path = "../../build_version.rs"]
+mod version;
+
 fn main() {
+    version::emit();
     let here = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let crates = here.join("..");
     let root = crates.join("..");

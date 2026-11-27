@@ -18,6 +18,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
+    "BUILD_NUMBER",
     ".gitignore",
     ".gitattributes",
     ".editorconfig",

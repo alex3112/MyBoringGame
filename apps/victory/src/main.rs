@@ -21,7 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "victory",
-    version,
+    version = victory_core::BUILD_VERSION,
     about = "Run an Xbox Series title natively on Windows"
 )]
 struct Cli {

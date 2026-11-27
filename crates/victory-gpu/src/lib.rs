@@ -15,6 +15,9 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+/// The same checked-in build number used by the command-line front end.
+pub const BUILD_VERSION: &str = concat!("0.", env!("VICTORY_BUILD_NUMBER"));
+
 #[cfg(windows)]
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]

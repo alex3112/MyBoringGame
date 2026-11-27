@@ -11,3 +11,6 @@ pub mod policy;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};
+
+/// The port's build version, independent of the Xbox executable's build ID.
+pub const BUILD_VERSION: &str = concat!("0.", env!("VICTORY_BUILD_NUMBER"));

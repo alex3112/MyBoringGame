@@ -47,6 +47,7 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    println!("port build     {}", victory_core::BUILD_VERSION);
     if execute {
         check_cpu_features()?;
     }

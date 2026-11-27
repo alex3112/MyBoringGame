@@ -21,6 +21,66 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Verify build counter
+        shell: pwsh
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $base = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $env:BASE_SHA } else { $env:BEFORE }
+          $head = if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $env:HEAD_SHA } else { $env:GITHUB_SHA }
+          $current = (git show "${head}:BUILD_NUMBER" | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $current -notmatch '^[1-9][0-9]* and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
+) {
+            throw 'Missing or invalid BUILD_NUMBER'
+          }
+          if ($base -and $base -notmatch '^0+ and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
+) {
+            $paths = @(git ls-tree --name-only $base -- BUILD_NUMBER)
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect previous build' }
+            if ($paths -contains 'BUILD_NUMBER') {
+              $previous = (git show "${base}:BUILD_NUMBER" | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0 -or $previous -notmatch '^[1-9][0-9]* and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests
+        run: cargo test --workspace --locked
+) {
+                throw 'Invalid previous BUILD_NUMBER'
+              }
+              if ([uint64]$current -ne ([uint64]$previous + 1)) {
+                throw "BUILD_NUMBER must increase by exactly one: $previous -> $current"
+              }
+            } elseif ($current -ne '125') {
+              throw 'Initial BUILD_NUMBER must be 125'
+            }
+          }
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2

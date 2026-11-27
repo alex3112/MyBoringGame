@@ -134,6 +134,7 @@ fn sample(start: Instant) -> Vec<Option<u64>> {
     row.extend(crate::watch::JOURNAL_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     row.extend(crate::shadow::SNAPSHOT_REUSE.iter().map(|n| Some(n.load(Relaxed))));
     for (_, meter) in METERS { row.extend(meter.sample().map(Some)); }
+    row.push(Some(env!("VICTORY_BUILD_NUMBER").parse().expect("validated build number")));
     row
 }
 
@@ -169,6 +170,7 @@ pub fn start() -> std::io::Result<()> {
             names.push(format!("{name}_{suffix}"));
         }
     }
+    names.push("build_number".into());
     writeln!(writer, "{}", names.join(","))?;
     writer.flush()?;
     let start = Instant::now();
