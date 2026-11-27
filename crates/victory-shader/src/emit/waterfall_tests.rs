@@ -83,6 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        raw_table_constants: lowered.raw_table_constants,
         root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -385,6 +386,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             root_cbvs: lowered.root_cbvs,
             root_srvs: lowered.root_srvs,
             root_uavs: lowered.root_uavs,
+            raw_table_constants: lowered.raw_table_constants,
             root_indexed_views: Vec::new(),
         };
         if let Ok(mut v) =

@@ -105,6 +105,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
         root_cbvs: result.root_cbvs,
         root_srvs: result.root_srvs,
         root_uavs: result.root_uavs,
+        raw_table_constants: result.raw_table_constants,
         root_indexed_views: res.root_indexed_views,
     };
     match validator::Validator::load(validator::Validator::default_path().as_deref()) {
