@@ -1193,6 +1193,9 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            if victory_gpu::settings_menu_open() {
+                return Some(PadState::default());
+            }
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1208,6 +1211,9 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
+            if victory_gpu::settings_menu_open() {
+                return Vec::new();
+            }
             let mut down = scripted();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no

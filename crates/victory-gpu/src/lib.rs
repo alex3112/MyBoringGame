@@ -102,6 +102,12 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The runtime graphics overlay owns host input while open.
+#[cfg(windows)]
+pub fn settings_menu_open() -> bool {
+    host::settings_menu::is_open()
+}
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]

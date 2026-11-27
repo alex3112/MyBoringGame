@@ -1,214 +1,476 @@
-//! An owned Win32 settings window, with a separate message thread so no
-//! SDK query or UI event runs under the D3D12 presenter lock.
-use std::cell::Cell;
-use std::ptr::{null, null_mut};
-use std::time::Duration;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, DEFAULT_GUI_FONT, GetStockObject};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+//! Settings overlay drawn into the game's own D3D12 backbuffer. No HWND
+//! is created. The CPU paints an antialiased UI only when it changes;
+//! immutable upload buffers are retained by the in-flight host list.
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::*;
+use windows_sys::Win32::Foundation::{POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetAsyncKeyState, GetKeyboardLayout, MapVirtualKeyExW, VkKeyScanExW,
+    GetAsyncKeyState, GetKeyboardLayout, MapVirtualKeyExW, VkKeyScanExW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CURSORINFO, CURSOR_SHOWING, GetClientRect, GetCursorInfo, GetCursorPos,
+    GetForegroundWindow, GetWindowThreadProcessId,
+};
 
-const CLOSE: usize = 200;
-const PROBE: usize = 201;
-const CAPTURE: usize = 202;
-const WIDTH: i32 = 610;
-const HEIGHT: i32 = 320;
+use super::{Host, HostList};
 
-thread_local! {
-    static COMMAND: Cell<usize> = const { Cell::new(0) };
+static OPEN: AtomicBool = AtomicBool::new(false);
+pub(crate) fn is_open() -> bool {
+    OPEN.load(Ordering::Acquire)
 }
 
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(Some(0)).collect()
-}
+const W: u32 = 800;
+const H: u32 = 410;
+const BG: [u8; 3] = [14, 25, 45];
+const BLUE: [u8; 3] = [31, 65, 123];
+const BUTTON: [u8; 3] = [27, 45, 76];
+const HOVER: [u8; 3] = [45, 88, 153];
+const TEXT: [u8; 3] = [226, 236, 252];
+const MUTED: [u8; 3] = [155, 181, 218];
+const ACCENT: [u8; 3] = [140, 192, 255];
 
-pub(super) fn start(owner: windows::Win32::Foundation::HWND) {
-    // HWND is an opaque handle; move only its integer representation across
-    // threads. This thread owns every control and all ADLX interfaces.
-    let owner = owner.0 as usize;
-    if let Err(e) = std::thread::Builder::new().name("victory-settings".into()).spawn(move || {
-        run(owner as HWND);
-    }) {
-        tracing::warn!(error = %e, "could not start settings menu");
+#[derive(Clone, Copy)]
+struct Hit {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+impl Hit {
+    fn contains(self, (x, y): (u32, u32)) -> bool {
+        x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
 }
+const PROBE: Hit = Hit { x: 390, y: 180, w: 382, h: 43 };
+const CAPTURE: Hit = Hit { x: 390, y: 232, w: 382, h: 43 };
+const CLOSE: Hit = Hit { x: 558, y: 351, w: 214, h: 40 };
 
-extern "system" fn wnd_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match message {
-        WM_CLOSE => {
-            COMMAND.with(|c| c.set(CLOSE));
-            0
-        }
-        WM_COMMAND if (wp >> 16) & 0xffff == 0 => {
-            COMMAND.with(|c| c.set(wp & 0xffff));
-            0
-        }
-        _ => unsafe { DefWindowProcW(hwnd, message, wp, lp) },
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
 }
-
-fn control(parent: HWND, class: &str, title: &str, id: usize, bounds: [i32; 4]) -> HWND {
-    let [x, y, width, height] = bounds;
-    let class_name = wide(class);
-    let text = wide(title);
-    let style = WS_CHILD | WS_VISIBLE | if id != 0 { WS_TABSTOP } else { 0 };
-    let hwnd = unsafe {
-        CreateWindowExW(0, class_name.as_ptr(), text.as_ptr(), style,
-            x, y, width, height, parent, id as _, GetModuleHandleW(null()), null())
-    };
-    if !hwnd.is_null() {
-        unsafe { SendMessageW(hwnd, WM_SETFONT, GetStockObject(DEFAULT_GUI_FONT) as usize, 1) };
-    }
-    hwnd
-}
-
-fn label(hwnd: HWND, text: &str) {
-    let text = wide(text);
-    unsafe { SetWindowTextW(hwnd, text.as_ptr()) };
-}
-
-struct Menu {
-    hwnd: HWND,
-    status: HWND,
-}
-
-impl Menu {
-    fn create(owner: HWND) -> Option<Self> {
-        let class = wide("VIctorySettingsWindow");
-        let caption = wide("VIctory | Graphics settings");
-        let instance = unsafe { GetModuleHandleW(null()) };
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: instance,
-            hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-            hbrBackground: (COLOR_WINDOW + 1) as _,
-            lpszClassName: class.as_ptr(),
-            ..Default::default()
-        };
-        unsafe { RegisterClassW(&wc) };
-        let hwnd = unsafe {
-            CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), caption.as_ptr(),
-                WS_POPUP | WS_CAPTION | WS_SYSMENU, 0, 0, WIDTH, HEIGHT,
-                owner, null_mut(), instance, null())
-        };
-        if hwnd.is_null() {
+impl Layout {
+    fn new((width, height): (u32, u32)) -> Option<Self> {
+        if width < 320 || height < 240 {
             return None;
         }
-        control(hwnd, "STATIC", "GRAPHICS / AMD FIDELITYFX FRAME GENERATION", 0, [18, 12, 550, 22]);
-        control(hwnd, "STATIC", "FSR 3.1 native frame generation (VIctory only)", 0, [18, 42, 550, 22]);
-        let generation = control(hwnd, "BUTTON", "Off - inputs not mapped", 0, [18, 68, 550, 32]);
-        unsafe { EnableWindow(generation, 0) };
-        let status = control(hwnd, "STATIC",
-            "Native interpolation is not active. First identify depth and motion vectors, then connect the presentation pipeline.",
-            0, [18, 113, 550, 68]);
-        control(hwnd, "BUTTON", "Check FidelityFX SDK", PROBE, [18, 193, 230, 32]);
-        let capture = control(hwnd, "BUTTON", "Capture FSR inputs", CAPTURE, [258, 193, 310, 32]);
-        unsafe { EnableWindow(capture, i32::from(cfg!(feature = "diagnostics"))) };
-        control(hwnd, "BUTTON", "Close", CLOSE, [390, 236, 178, 30]);
-        if status.is_null() || generation.is_null() || capture.is_null() {
-            unsafe { DestroyWindow(hwnd) };
+        let w = (width * 78 / 100).min(height * 86 / 100 * W / H).min(1600);
+        let h = w * H / W;
+        Some(Self { x: (width - w) / 2, y: (height - h) / 2, w, h })
+    }
+    fn local(self, x: u32, y: u32) -> Option<(u32, u32)> {
+        let x = x.checked_sub(self.x)?;
+        let y = y.checked_sub(self.y)?;
+        (x < self.w && y < self.h).then(|| (x * W / self.w, y * H / self.h))
+    }
+    fn sx(self, x: u32) -> u32 { x * self.w / W }
+    fn sy(self, y: u32) -> u32 { y * self.h / H }
+}
+
+fn key(vk: i32) -> (bool, bool) {
+    let v = unsafe { GetAsyncKeyState(vk) };
+    (v < 0, v & 1 != 0)
+}
+fn toggle_key(hwnd: HWND) -> i32 {
+    let thread = unsafe { GetWindowThreadProcessId(hwnd.0, null_mut()) };
+    let layout = unsafe { GetKeyboardLayout(thread) };
+    let mapped = unsafe { VkKeyScanExW(0x00b2, layout) };
+    if mapped == -1 {
+        (unsafe { MapVirtualKeyExW(0x29, 3, layout) }) as i32
+    } else {
+        i32::from(mapped) & 0xff
+    }
+}
+fn pointer(hwnd: HWND, size: (u32, u32), layout: Layout) -> Option<(u32, u32)> {
+    let mut point = POINT::default();
+    let mut rect = RECT::default();
+    unsafe {
+        if GetCursorPos(&mut point) == 0 || ScreenToClient(hwnd.0, &mut point) == 0
+            || GetClientRect(hwnd.0, &mut rect) == 0 {
             return None;
         }
-        Some(Self { hwnd, status })
     }
+    if rect.right <= 0 || rect.bottom <= 0 || point.x < 0 || point.y < 0
+        || point.x >= rect.right || point.y >= rect.bottom {
+        return None;
+    }
+    layout.local(
+        (i64::from(point.x) * i64::from(size.0) / i64::from(rect.right)) as u32,
+        (i64::from(point.y) * i64::from(size.1) / i64::from(rect.bottom)) as u32,
+    )
+}
+fn hidden_cursor() -> bool {
+    let mut info = CURSORINFO { cbSize: size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut info) != 0 && info.flags & CURSOR_SHOWING == 0 }
+}
 
-    /// True means the menu should close immediately so the requested
-    /// capture samples the game, rather than a window with no input focus.
-    fn command(&self, id: usize) -> bool {
-        match id {
-            PROBE => {
-                let text = match super::fidelityfx::probe() {
-                    Ok(versions) => format!("FidelityFX providers: {versions}. Interpolation still off; inputs not mapped."),
-                    Err(e) => e,
-                };
-                label(self.status, &text);
+struct Canvas {
+    dc: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    layout: Layout,
+}
+impl Canvas {
+    fn new(layout: Layout) -> Option<Self> {
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = layout.w as i32;
+        info.bmiHeader.biHeight = -(layout.h as i32);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        unsafe {
+            let dc = CreateCompatibleDC(null_mut());
+            if dc.is_null() { return None; }
+            let mut bits = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bitmap.is_null() || bits.is_null() {
+                if !bitmap.is_null() { DeleteObject(bitmap); }
+                DeleteDC(dc);
+                return None;
             }
-            #[cfg(feature = "diagnostics")]
-            CAPTURE => match crate::capture::request_fsr() {
-                Ok(()) => return true,
-                Err(e) => label(self.status, &e),
-            },
-            _ => {}
+            let old = SelectObject(dc, bitmap);
+            if old.is_null() || old as isize == -1 {
+                DeleteObject(bitmap);
+                DeleteDC(dc);
+                return None;
+            }
+            SetBkMode(dc, TRANSPARENT as i32);
+            Some(Self { dc, bitmap, old, bits: bits.cast(), layout })
         }
-        false
     }
 
-    fn show(&self, owner: HWND) {
-        let mut rect = RECT::default();
-        if unsafe { GetWindowRect(owner, &mut rect) } != 0 {
-            let x = rect.left + (rect.right - rect.left - WIDTH) / 2;
-            let y = rect.top + (rect.bottom - rect.top - HEIGHT) / 2;
-            unsafe { SetWindowPos(self.hwnd, null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
-        }
+    fn rect(&mut self, hit: Hit, rgb: [u8; 3]) {
+        let l = self.layout;
+        let x0 = l.sx(hit.x).min(l.w);
+        let x1 = l.sx(hit.x + hit.w).min(l.w);
+        let y0 = l.sy(hit.y).min(l.h);
+        let y1 = l.sy(hit.y + hit.h).min(l.h);
+        let pixel = [rgb[2], rgb[1], rgb[0], 255];
         unsafe {
-            ShowWindow(self.hwnd, SW_SHOW);
-            SetForegroundWindow(self.hwnd);
+            for y in y0..y1 {
+                let row = std::slice::from_raw_parts_mut(
+                    self.bits.add(((y * l.w + x0) * 4) as usize), ((x1 - x0) * 4) as usize);
+                for dst in row.chunks_exact_mut(4) { dst.copy_from_slice(&pixel); }
+            }
         }
     }
 
-    fn hide(&self, owner: HWND) {
+    fn text(&self, x: u32, y: u32, text: &str, size: u32, bold: bool, rgb: [u8; 3]) {
+        let face: Vec<u16> = "Segoe UI".encode_utf16().chain(Some(0)).collect();
+        let text: Vec<u16> = text.encode_utf16().collect();
+        let l = self.layout;
         unsafe {
-            ShowWindow(self.hwnd, SW_HIDE);
-            SetForegroundWindow(owner);
-        }
-    }
-}
-
-fn run(owner: HWND) {
-    let Some(menu) = Menu::create(owner) else {
-        tracing::warn!("could not create graphics settings window");
-        return;
-    };
-    let mut down = false;
-    let mut visible = false;
-    let mut escape = false;
-    loop {
-        if unsafe { IsWindow(owner) } == 0 {
-            break;
-        }
-        let mut msg = MSG::default();
-        while unsafe { PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) } != 0 {
-            if msg.message == WM_QUIT {
+            let font = CreateFontW(-(l.sy(size).max(10) as i32), 0, 0, 0,
+                (if bold { FW_BOLD } else { FW_NORMAL }) as i32, 0, 0, 0,
+                u32::from(DEFAULT_CHARSET), u32::from(OUT_DEFAULT_PRECIS),
+                u32::from(CLIP_DEFAULT_PRECIS), u32::from(ANTIALIASED_QUALITY),
+                u32::from(DEFAULT_PITCH), face.as_ptr());
+            if font.is_null() { return; }
+            let old = SelectObject(self.dc, font);
+            if old.is_null() || old as isize == -1 {
+                DeleteObject(font);
                 return;
             }
-            unsafe {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            SetTextColor(self.dc, u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16));
+            TextOutW(self.dc, l.sx(x) as i32, l.sy(y) as i32, text.as_ptr(), text.len() as i32);
+            SelectObject(self.dc, old);
+            DeleteObject(font);
+        }
+    }
+
+    fn pixels(&self) -> &[u8] {
+        unsafe {
+            GdiFlush();
+            std::slice::from_raw_parts(self.bits, (self.layout.w * self.layout.h * 4) as usize)
+        }
+    }
+}
+impl Drop for Canvas {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+fn bytes_per_pixel(format: DXGI_FORMAT) -> Option<usize> {
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
+        DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
+        _ => None,
+    }
+}
+
+// 8-bit unorm to IEEE half, for [0,1] only.
+fn half(v: u8) -> u16 {
+    if v == 0 { return 0; }
+    let bits = (f32::from(v) / 255.0).to_bits();
+    (((bits >> 23) - 112) << 10 | ((bits >> 13) & 1023)) as u16
+}
+fn convert(pixel: &[u8], dst: &mut [u8], format: DXGI_FORMAT) {
+    let [b, g, r, _] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM => dst.copy_from_slice(&[r, g, b, 255]),
+        DXGI_FORMAT_B8G8R8A8_UNORM => dst.copy_from_slice(&[b, g, r, 255]),
+        DXGI_FORMAT_R10G10B10A2_UNORM => {
+            let c = |v: u8| u32::from(v) * 1023 / 255;
+            dst.copy_from_slice(&(c(r) | c(g) << 10 | c(b) << 20 | 3 << 30).to_le_bytes());
+        }
+        DXGI_FORMAT_R16G16B16A16_FLOAT => {
+            for (p, v) in dst.chunks_exact_mut(2).zip([r, g, b, 255]) {
+                p.copy_from_slice(&half(v).to_le_bytes());
             }
         }
-        let foreground = unsafe { GetForegroundWindow() };
-        let thread = unsafe { GetWindowThreadProcessId(foreground, null_mut()) };
-        let layout = unsafe { GetKeyboardLayout(thread) };
-        // Resolve ² on the active layout; fallback to the physical key
-        // left of 1 (grave on US keyboards). Use a rising edge.
-        let mapped = unsafe { VkKeyScanExW(0x00b2, layout) };
-        let vk = if mapped == -1 {
-            (unsafe { MapVirtualKeyExW(0x29, 3, layout) }) as i32
-        } else {
-            i32::from(mapped) & 0xff
-        };
-        let pressed = unsafe { GetAsyncKeyState(vk) } < 0;
-        let esc_pressed = unsafe { GetAsyncKeyState(0x1b) } < 0;
-        let id = COMMAND.with(|c| c.replace(0));
-        let toggle = pressed && !down && (foreground == owner || foreground == menu.hwnd);
-        if (toggle && visible) || (visible && id == CLOSE)
-            || (visible && foreground == menu.hwnd && esc_pressed && !escape)
-        {
-            menu.hide(owner);
-            visible = false;
-        } else if toggle {
-            menu.show(owner);
-            visible = true;
-        } else if visible && id != 0 && menu.command(id) {
-            menu.hide(owner);
-            visible = false;
-        }
-        down = pressed;
-        escape = esc_pressed;
-        std::thread::sleep(Duration::from_millis(16));
+        _ => {}
     }
-    unsafe { DestroyWindow(menu.hwnd) };
+}
+
+struct Picture {
+    resource: ID3D12Resource,
+    layout: Layout,
+    format: DXGI_FORMAT,
+    pitch: u32,
+    hover: u8,
+    cursor: Option<(u32, u32)>,
+    revision: u64,
+}
+
+pub(super) struct Menu {
+    down: bool,
+    mouse_down: bool,
+    escape_down: bool,
+    status: String,
+    revision: u64,
+    probe: Option<Receiver<Result<String, String>>>,
+    picture: Option<Picture>,
+}
+impl Menu {
+    pub(super) fn new() -> Self {
+        OPEN.store(false, Ordering::Release);
+        Self {
+            down: false, mouse_down: false, escape_down: false,
+            status: "Native interpolation unavailable until depth and motion vectors are mapped.".into(),
+            revision: 0, probe: None, picture: None,
+        }
+    }
+
+    fn status(&mut self, message: String) {
+        self.status = message;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn action(&mut self, hover: u8) {
+        match hover {
+            1 if self.probe.is_none() => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                match std::thread::Builder::new().name("victory-fidelityfx-probe".into()).spawn(move || {
+                    let _ = tx.send(super::fidelityfx::probe());
+                }) {
+                    Ok(_) => {
+                        self.probe = Some(rx);
+                        self.status("Checking the native FidelityFX runtime...".into());
+                    }
+                    Err(e) => self.status(format!("Could not start SDK check: {e}")),
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            2 => match crate::capture::request_fsr() {
+                Ok(()) => {
+                    self.status("Capture scheduled. Move the camera; see the launch log.".into());
+                    OPEN.store(false, Ordering::Release);
+                }
+                Err(e) => self.status(e),
+            },
+            3 => OPEN.store(false, Ordering::Release),
+            _ => {}
+        }
+    }
+
+    fn poll_probe(&mut self) {
+        let result = self.probe.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(result)) => {
+                self.probe = None;
+                match result {
+                    Ok(versions) => self.status(format!("SDK ready: {versions}. Interpolation still off.")),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "FidelityFX SDK check failed");
+                        self.status(e);
+                    }
+                }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.probe = None;
+                self.status("SDK check did not complete.".into());
+            }
+            _ => {}
+        }
+    }
+
+    fn paint(&self, host: &Host, layout: Layout, format: DXGI_FORMAT, hover: u8, cursor: Option<(u32,u32)>) -> Option<Picture> {
+        let mut c = Canvas::new(layout)?;
+        c.rect(Hit { x: 0, y: 0, w: W, h: H }, BG);
+        c.rect(Hit { x: 16, y: 55, w: 768, h: 39 }, BLUE);
+        c.rect(Hit { x: 390, y: 128, w: 382, h: 43 }, BUTTON);
+        for (id, rect) in [(1, PROBE), (2, CAPTURE), (3, CLOSE)] {
+            c.rect(rect, if hover == id { HOVER } else if id == 3 { BLUE } else { BUTTON });
+        }
+        c.rect(Hit { x: 28, y: 286, w: 744, h: 1 }, [54, 76, 110]);
+        c.text(27, 14, "VIctory", 28, true, ACCENT);
+        c.text(627, 23, crate::BUILD_VERSION, 16, false, MUTED);
+        c.text(28, 63, "Graphics Settings", 22, true, TEXT);
+        c.text(28, 103, "AMD FidelityFX Frame Generation", 17, true, ACCENT);
+        c.text(28, 139, "Frame Generation", 20, false, TEXT);
+        c.text(411, 140, "Off - inputs not mapped", 19, false, MUTED);
+        c.text(28, 191, "FidelityFX SDK", 20, false, TEXT);
+        c.text(411, 191, "Check SDK", 19, true, TEXT);
+        c.text(28, 243, "Engine input audit", 20, false, TEXT);
+        c.text(411, 243, if cfg!(feature = "diagnostics") { "Capture FSR inputs" } else { "Diagnostics build required" }, 18, true, if cfg!(feature = "diagnostics") { TEXT } else { MUTED });
+        // Keep arbitrary loader error messages inside the panel.
+        let mut lines = vec![String::new()];
+        for word in self.status.split_whitespace() {
+            if lines.last().is_some_and(|s| s.chars().count() + word.chars().count() > 84) && lines.len() < 3 {
+                lines.push(String::new());
+            }
+            if let Some(line) = lines.last_mut() {
+                if !line.is_empty() { line.push(' '); }
+                line.push_str(word);
+            }
+        }
+        for (n, line) in lines.iter().enumerate() {
+            let short: String = line.chars().take(92).collect();
+            c.text(28, 296 + n as u32 * 17, &short, 15, false, MUTED);
+        }
+        c.text(28, 362, "² / Esc: close", 17, false, MUTED);
+        c.text(634, 362, "Close", 19, true, TEXT);
+        if let Some((x,y)) = cursor {
+            c.text(x.min(W-24), y.min(H-25), "↖", 24, true, TEXT);
+        }
+
+        let bpp = bytes_per_pixel(format)?;
+        let pitch = (layout.w * bpp as u32).next_multiple_of(256);
+        let size = u64::from(pitch) * u64::from(layout.h);
+        let (resource, mapped) = host.upload_buffer(size)?;
+        let src = c.pixels();
+        unsafe {
+            let out = std::slice::from_raw_parts_mut(mapped, size as usize);
+            out.fill(0);
+            for y in 0..layout.h as usize {
+                let src = &src[y * layout.w as usize * 4..(y+1) * layout.w as usize * 4];
+                let dst = &mut out[y * pitch as usize..y * pitch as usize + layout.w as usize * bpp];
+                for (p, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(bpp)) {
+                    convert(p, d, format);
+                }
+            }
+            resource.Unmap(0, None);
+        }
+        Some(Picture { resource, layout, format, pitch, hover, cursor, revision: self.revision })
+    }
+
+    pub(super) fn draw(&mut self, host: &Host, copy: &HostList, back: &ID3D12Resource,
+        hwnd: HWND, size: (u32,u32), format: DXGI_FORMAT) {
+        let (down, tapped) = key(toggle_key(hwnd));
+        let (escape, esc_tap) = key(0x1b);
+        let (mouse, mouse_tap) = key(1);
+        let focused = unsafe { GetForegroundWindow() == hwnd.0 };
+        if focused && (down || tapped) && !self.down {
+            OPEN.fetch_xor(true, Ordering::AcqRel);
+        }
+        if !focused || (is_open() && ((escape || esc_tap) && !self.escape_down)) {
+            OPEN.store(false, Ordering::Release);
+        }
+        let clicked = (mouse || mouse_tap) && !self.mouse_down;
+        self.down = down;
+        self.escape_down = escape;
+        self.mouse_down = mouse;
+        if !is_open() {
+            self.picture = None;
+            return;
+        }
+        self.poll_probe();
+        let Some(layout) = Layout::new(size) else {
+            OPEN.store(false, Ordering::Release);
+            return;
+        };
+        let pos = pointer(hwnd, size, layout);
+        let hover = pos.map_or(0, |p| {
+            if PROBE.contains(p) { 1 }
+            else if cfg!(feature = "diagnostics") && CAPTURE.contains(p) { 2 }
+            else if CLOSE.contains(p) { 3 }
+            else { 0 }
+        });
+        if clicked { self.action(hover); }
+        if !is_open() {
+            self.picture = None;
+            return;
+        }
+        let cursor = if hidden_cursor() { pos } else { None };
+        if self.picture.as_ref().is_none_or(|p| p.layout != layout || p.format != format
+            || p.hover != hover || p.cursor != cursor || p.revision != self.revision) {
+            self.picture = self.paint(host, layout, format, hover, cursor);
+        }
+        let Some(p) = &self.picture else {
+            OPEN.store(false, Ordering::Release);
+            tracing::warn!("settings overlay could not allocate or render");
+            return;
+        };
+        // The backbuffer is already COPY_DEST here. Keep this immutable
+        // upload alive until the exact submission that uses it has retired.
+        copy.keep(&p.resource);
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&p.resource),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format, Width: layout.w, Height: layout.h, Depth: 1, RowPitch: p.pitch,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(back),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            copy.list.CopyTextureRegion(&to, layout.x, layout.y, 0, &from, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn layout_and_hit_test() {
+        for size in [(640, 480), (1920, 1080), (3840, 2160)] {
+            let l = Layout::new(size).unwrap();
+            assert!(l.x + l.w <= size.0 && l.y + l.h <= size.1);
+            let x = l.x + l.sx(PROBE.x + 10);
+            let y = l.y + l.sy(PROBE.y + 10);
+            assert!(PROBE.contains(l.local(x,y).unwrap()));
+        }
+    }
+    #[test]
+    fn pixel_formats() {
+        let mut dst = [0; 8];
+        convert(&[1,2,3,0], &mut dst[..4], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(&dst[..4], &[3,2,1,255]);
+        convert(&[0,0,255,0], &mut dst, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        assert_eq!(dst, [0,60,0,0,0,0,0,60]);
+    }
 }

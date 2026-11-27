@@ -4222,7 +4222,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod fidelityfx;
-mod settings_menu;
+pub(crate) mod settings_menu;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -9396,6 +9396,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    settings: settings_menu::Menu,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9942,6 +9943,7 @@ impl Host {
             };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.settings.draw(self, copy, &back, p.hwnd, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10033,7 +10035,6 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
-            settings_menu::start(hwnd);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
@@ -10045,6 +10046,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                settings: settings_menu::Menu::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

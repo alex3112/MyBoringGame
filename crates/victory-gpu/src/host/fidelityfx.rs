@@ -1,5 +1,5 @@
 //! Native FidelityFX API discovery for FSR 3.1, independently of Adrenalin.
-//! ABI from AMD's SDK v1.1.4 ffx_api.h and ffx_framegeneration.h.
+//! ABI from AMD's modular SDK and v1.1.4 ffx_api.h / ffx_framegeneration.h.
 //! No generation is enabled before real depth/motion inputs are identified.
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
@@ -39,18 +39,43 @@ struct Library(HMODULE);
 impl Library {
     fn open() -> Result<Self> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let path = exe.with_file_name("amd_fidelityfx_dx12.dll");
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let dll = unsafe {
-            LoadLibraryExW(
-                wide.as_ptr(), null_mut(),
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            )
-        };
-        if dll.is_null() {
-            return Err(format!("Install the official FidelityFX SDK 1.1.4 DX12 DLL beside victory.exe: {}", path.display()));
+        // SDK 2.x has a loader and separate effect DLLs; SDK 1.1.x
+        // exposes the same public API through the monolithic DX12 library.
+        let mut errors = Vec::new();
+        for name in ["amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_dx12.dll"] {
+            let path = exe.with_file_name(name);
+            if !path.is_file() {
+                continue;
+            }
+            if name == "amd_fidelityfx_loader_dx12.dll"
+                && !exe.with_file_name("amd_fidelityfx_framegeneration_dx12.dll").is_file()
+            {
+                errors.push("Missing amd_fidelityfx_framegeneration_dx12.dll".to_owned());
+                continue;
+            }
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let dll = unsafe {
+                LoadLibraryExW(wide.as_ptr(), null_mut(),
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+            };
+            if dll.is_null() {
+                let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                errors.push(format!("{name}: Windows error {code}"));
+                continue;
+            }
+            let library = Self(dll);
+            if unsafe { GetProcAddress(library.0, c"ffxQuery".as_ptr().cast()) }.is_none() {
+                errors.push(format!("{name}: missing ffxQuery export"));
+                continue;
+            }
+            tracing::info!(%name, "FidelityFX DX12 runtime loaded");
+            return Ok(library);
         }
-        Ok(Self(dll))
+        if errors.is_empty() {
+            Err("Missing FidelityFX DX12 loader and frame-generation DLL beside victory.exe".into())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 

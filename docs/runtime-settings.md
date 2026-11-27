@@ -1,32 +1,31 @@
-# Native FSR 3.1 integration, stage 1 (build 0.129)
+# Runtime graphics menu (build 0.130)
 
-AFMF and ADLX have been removed. The port does not change any AMD driver setting.
-The menu (key ²) is retained. The Frame Generation control is explicitly disabled:
-no interpolation runs in this build. A provider probe uses the native AMD
-FidelityFX API (SDK 1.1.4) against the actual host D3D12 device, if the
-official amd_fidelityfx_dx12.dll is beside victory.exe. The SDK is not
-redistributed by this repository. Checking it does not allocate a frame
-generation context or change the swapchain.
+Press ² in the game to open/close the blue settings overlay, or Escape / Close
+to close it. It is rendered in the game's own D3D12 backbuffer before Present,
+not a separate Windows window. Controls are mouse hit-tested in backbuffer
+coordinates with client-size scaling. GameInput keyboard and gamepad readings
+are neutral while it is open. The title continues rendering (not paused).
+The menu's immutable upload buffer is reused until contents change; nothing
+is drawn when closed. No AMD driver settings are touched.
 
-In a diagnostics build, open the settings menu in controllable 3D gameplay
-and click Capture FSR inputs. The menu closes and schedules target dumps
-32 and 40 native presents later. Slowly pan the camera after clicking.
-The capture folder is fsr-input-audit-<pid> in the working directory
-(or VICTORY_CAPTURE if set). It includes target descriptions, existing PNG
-previews and the frame's recorded operations. Dumps are expensive and are
-not a benchmark. No captures run unless explicitly requested or previous
-capture flags are used. The existing diagnostic target collector may not
-observe all targets in deferred/behind submission paths; check logs and
-the number of candidates before interpreting the result. Resource addresses
-are session-local, not stable identifiers.
+FidelityFX SDK 2.x modular DX12 packages: place amd_fidelityfx_loader_dx12.dll
+and amd_fidelityfx_framegeneration_dx12.dll beside victory.exe. Other official
+SDK dependencies may be kept there. Older SDK 1.1.x monolithic
+amd_fidelityfx_dx12.dll is also accepted. Check SDK loads the API and queries
+providers on the actual D3D12 device; failures report Windows loader error
+codes or missing exports and are logged. This is not a frame generation
+dispatch. Frame Generation remains explicitly off until actual game inputs
+are identified, no fabricated frames are presented.
 
-The next integration stage requires identifying the depth and motion-vector
-producer passes and encodings, render resolution, jitter, camera projection
-and reset conditions. The SDK's prepare call cannot use guessed textures.
-Then create a frame-generation context and swapchain, configure/prepare each
-native frame, register HUD composition as appropriate and measure native and
-generated presents separately. No placeholder frames or duplicate presents
-are implemented.
+In a diagnostics build, open the settings menu in controllable 3D gameplay,
+click Capture FSR inputs, then move the camera slowly. The overlay closes
+and captures targets 32 and 40 native presents later. The capture folder is
+fsr-input-audit-<pid> in the working directory (or VICTORY_CAPTURE if set).
+Return the folder and launch log. Readbacks are costly, not a benchmark.
+The existing target collector may miss deferred-path writes. Resource
+addresses are session-local. Native interpolation still requires validated
+depth, motion vectors, projection and jitter data plus a generation context,
+presentation, frame pacing, HUD composition and native/generated FPS metrics.
 
-References: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4
-and https://gpuopen.com/manuals/fidelityfx_sdk/techniques/super-resolution-interpolation/
+SDK references: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+and https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4
