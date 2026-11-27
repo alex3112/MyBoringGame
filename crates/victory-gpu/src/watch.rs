@@ -1264,6 +1264,21 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     }
 }
 
+/// A fresh native private commitment begins a new CPU-memory version.
+/// Even a zero-filled page with no write-watch bit set must invalidate a
+/// shadow that previously covered this virtual address. The caller only
+/// uses this for ordinary native write-watched reservations.
+pub fn title_memory_native_committed(at: usize, len: usize) {
+    if len == 0 { return; }
+    title_memory_allocated(at, len);
+    let mut j = journal_mut();
+    let now = next_asking();
+    if j.kept { j.ahead_asked = now; }
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.note(page, WHOLE, now);
+    }
+}
+
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
 /// [`title_memory_remapped`]), which no title we know does.

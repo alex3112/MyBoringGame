@@ -68,6 +68,100 @@ const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+// The title also reserves private memory through ordinary Windows APIs.
+// XMemVirtualAlloc already requests MEM_WRITE_WATCH; the native path
+// previously did not. A large GPU-visible buffer from that path therefore
+// took the whole-copy fallback on every refresh.
+const NATIVE_WATCH_MIN: usize = MIB;
+const WATCHED_HEAP_HEADER: usize = 1usize << (usize::BITS - 1);
+static NATIVE_WATCHED: LazyLock<Mutex<BTreeMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static NATIVE_WATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static NATIVE_WATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn native_write_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NATIVE_WRITE_WATCH").is_none_or(|v| v != "0"))
+}
+
+// Only ordinary, host-chosen, private reservations. Never add write
+// watching to placeholders, physical/large pages, executable memory,
+// special allocation types, or an existing reservation.
+fn native_watch_eligible(base: *const c_void, size: usize, kind: u32, protect: u32) -> bool {
+    native_write_watch() && base.is_null() && size >= NATIVE_WATCH_MIN
+        && (kind == MEM_RESERVE || kind == (MEM_RESERVE | MEM_COMMIT))
+        && (protect == PAGE_READWRITE || kind == MEM_RESERVE && protect == PAGE_NOACCESS)
+}
+
+fn note_native_reservation(at: usize, size: usize, committed: bool) {
+    let end = at.saturating_add(size);
+    NATIVE_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).insert(at, end);
+    let n = NATIVE_WATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let bytes = NATIVE_WATCH_BYTES.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+    if n.is_power_of_two() {
+        tracing::info!(n, bytes, address = format_args!("{at:#x}"), size, committed,
+            "native private allocation with CPU write tracking (VICTORY_NATIVE_WRITE_WATCH)");
+    }
+    if committed {
+        victory_gpu::title_memory_native_committed(at, size);
+    }
+}
+
+fn note_native_commit(at: usize, size: usize) {
+    if size == 0 { return; }
+    let tracked = {
+        let map = NATIVE_WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        map.range(..=at).next_back().is_some_and(|(_, &end)| at.saturating_add(size) <= end)
+    };
+    if tracked {
+        victory_gpu::title_memory_native_committed(at, size);
+    }
+}
+
+fn note_native_release(at: usize) {
+    if NATIVE_WATCH_COUNT.load(Ordering::Relaxed) != 0 {
+        NATIVE_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&at);
+    }
+}
+
+// Guest import only: calls below are to the host API, not this wrapper.
+extern "system" fn title_virtual_alloc(base: *const c_void, size: usize, kind: u32, protect: u32) -> *mut c_void {
+    if native_watch_eligible(base, size, kind, protect) {
+        // SAFETY: the title's original arguments; WRITE_WATCH is legal for
+        // a private reservation, and no existing pages change protection.
+        let at = unsafe { VirtualAlloc(base, size, kind | MEM_WRITE_WATCH, protect) };
+        if !at.is_null() {
+            note_native_reservation(at as usize, size, kind & MEM_COMMIT != 0);
+            return at;
+        }
+    }
+    // Preserve the original API if the optional watched reservation fails.
+    let at = unsafe { VirtualAlloc(base, size, kind, protect) };
+    if !at.is_null() && kind == MEM_COMMIT {
+        note_native_commit(at as usize, size);
+    }
+    at
+}
+
+extern "system" fn title_virtual_alloc2(process: HANDLE, base: *const c_void, size: usize, kind: u32,
+    protect: u32, params: *mut MEM_EXTENDED_PARAMETER, count: u32) -> *mut c_void
+{
+    // Do not change remote-process allocations or extended parameters.
+    let local = process == unsafe { GetCurrentProcess() };
+    if local && count == 0 && native_watch_eligible(base, size, kind, protect) {
+        let at = unsafe { VirtualAlloc2(process, base, size, kind | MEM_WRITE_WATCH, protect, params, count) };
+        if !at.is_null() {
+            note_native_reservation(at as usize, size, kind & MEM_COMMIT != 0);
+            return at;
+        }
+    }
+    let at = unsafe { VirtualAlloc2(process, base, size, kind, protect, params, count) };
+    if local && !at.is_null() && kind == MEM_COMMIT {
+        note_native_commit(at as usize, size);
+    }
+    at
+}
+
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
@@ -333,6 +427,28 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // Large XMemAllocDefault allocations that would otherwise come from
+    // an untracked host heap get their own ordinary watched reservation.
+    // The existing header and alignment contract are retained; the high
+    // bit distinguishes VirtualFree from Rust's allocator in the free path.
+    if native_write_watch() && size >= NATIVE_WATCH_MIN && layout.align() <= PAGE {
+        if let Some(bytes) = layout.size().checked_next_multiple_of(PAGE) {
+            let base = unsafe { VirtualAlloc(std::ptr::null(), bytes,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+            if !base.is_null() {
+                note_native_reservation(base as usize, bytes, true);
+                // SAFETY: VirtualAlloc aligns to the allocation granularity;
+                // the allocation holds at least layout.size() bytes.
+                unsafe {
+                    let user = base.add(layout.align());
+                    user.sub(HEADER).cast::<[usize; 2]>()
+                        .write([layout.size(), layout.align() | WATCHED_HEAP_HEADER]);
+                    victory_gpu::memory_audit::TITLE_HEAP.add(layout.size() as u64);
+                    return user.cast();
+                }
+            }
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -369,6 +485,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & WATCHED_HEAP_HEADER != 0 {
+            let align = align & !WATCHED_HEAP_HEADER;
+            let base = user.sub(align);
+            victory_gpu::title_memory_freed(base as usize, 0);
+            if VirtualFree(base.cast(), 0, MEM_RELEASE) != 0 {
+                note_native_release(base as usize);
+                victory_gpu::memory_audit::TITLE_HEAP.remove(size as u64);
+            }
+            return;
+        }
         victory_gpu::memory_audit::TITLE_HEAP.remove(size as u64);
         dealloc(
             user.sub(align),
@@ -1893,6 +2019,9 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     // SAFETY: the title's own arguments.
     let freed = unsafe { VirtualFree(address, size, kind) };
     if freed != 0 {
+        if kind == MEM_RELEASE {
+            note_native_release(address as usize);
+        }
         victory_gpu::memory_audit::VIRTUAL_FREE_CALL_BYTES.fetch_add(size as u64, Ordering::Relaxed);
         victory_gpu::memory_audit::VIRTUAL_FREE_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1904,6 +2033,8 @@ pub(crate) fn module() -> HleModule {
         name: "xmem",
         dlls: &["xmem.dll", "kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
         exports: vec![
+            crate::HleExport { name: "VirtualAlloc", address: title_virtual_alloc as *const () as usize },
+            crate::HleExport { name: "VirtualAlloc2", address: title_virtual_alloc2 as *const () as usize },
             crate::HleExport { name: "VirtualFree", address: title_virtual_free as *const () as usize },
             hle_export!(XMemAlloc),
             hle_export!(XMemFree),
@@ -1933,6 +2064,33 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn native_watch_ordinary_reservation_and_large_heap() {
+        if !native_write_watch() { return; }
+        let check = |p: *mut c_void, bytes: usize| {
+            assert!(!p.is_null());
+            let mut found = vec![0usize; bytes.div_ceil(4096)];
+            let (mut count, mut granularity) = (found.len(), 0u32);
+            // Reset first; then one CPU write must be reported.
+            unsafe {
+                use windows_sys::Win32::System::Memory::GetWriteWatch;
+                assert_eq!(GetWriteWatch(1, p, bytes, found.as_mut_ptr().cast(), &mut count, &mut granularity), 0);
+                p.cast::<u8>().write_volatile(0x5a);
+                count = found.len();
+                assert_eq!(GetWriteWatch(1, p, bytes, found.as_mut_ptr().cast(), &mut count, &mut granularity), 0);
+                assert!(count >= 1);
+            }
+        };
+        let p = title_virtual_alloc(std::ptr::null(), MIB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        check(p, MIB);
+        assert_ne!(title_virtual_free(p, 0, MEM_RELEASE), 0);
+        let attributes = 0x10 << ALIGNMENT_SHIFT;
+        let p = XMemAllocDefault(MIB, attributes);
+        assert_eq!(p as usize % PAGE, 0);
+        check(p, MIB);
+        XMemFreeDefault(p, attributes);
     }
 
     #[test]
