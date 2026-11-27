@@ -893,7 +893,7 @@ impl View {
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
     #[cfg(windows)]
-    fn is_buffer(&self) -> bool {
+    pub(crate) fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
             View::Shader(r, _) | View::Unordered(r, _, _) => {
