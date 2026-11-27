@@ -59,6 +59,8 @@ pub(super) struct Placed {
     pub(super) shadow: std::sync::Arc<Shadow>,
     /// Upload memory the list copies from, to be given the source's bytes.
     from: Option<usize>,
+    /// Native source of a GPU-to-GPU copy, retained by its refresh too.
+    source: Option<std::sync::Arc<Shadow>>,
 }
 
 impl Placed {
@@ -98,6 +100,116 @@ impl Placed {
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
     }
+}
+
+// GPU ownership of a destination until its existing relay copy-back.
+// The live Shadow ID identifies the exact native backing, not merely a
+// guest address. The existing per-flight fence is the version boundary.
+pub(super) struct Owned {
+    pub(super) list: usize,
+    pub(super) step: usize,
+    pub(super) shadow: std::sync::Arc<Shadow>,
+    pub(super) from: usize,
+    pub(super) to: usize,
+}
+
+static OWNED_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn ownership_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_MEMORY_OWNERSHIP").is_none_or(|v| v != "0"))
+}
+
+pub(super) fn ownership_line(frames: f64) {
+    let [candidates, taken, bytes] = OWNED_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("GPU memory ownership per frame (VICTORY_GPU_MEMORY_OWNERSHIP={}): {:.1} candidates, {:.1} GPU-only copies, {:.2} MiB eager CPU mirrors omitted",
+        u8::from(ownership_on()), candidates, taken, bytes / 1048576.0);
+}
+
+fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < a.1 && b.0 < b.1 && a.0 < b.1 && b.0 < a.1
+}
+
+/// No CPU reader of the destination in the batch; no CPU writer of either
+/// operand and no other backing that would need the destination's new
+/// bytes before the GPU runs. Unknown steps fail closed. Same-list and
+/// joined-list ordering is left untouched for all other copies.
+fn conflicts(step: &Step, p: &Placed) -> bool {
+    let dst = (p.dst, p.dst + p.len);
+    let src = (p.src, p.src + p.len);
+    let reads = |a, b| overlaps(dst, (a, b));
+    let writes = |a, b| reads(a, b) || overlaps(src, (a, b));
+    match step {
+        &Step::Copy(d, s, n) => writes(d, d.saturating_add(n)) || reads(s, s.saturating_add(n)),
+        &Step::Fill(_, s, n, _) => reads(s, s.saturating_add(n)),
+        Step::Texture(staging) => {
+            let (a, n) = staging.memory();
+            reads(a, a.saturating_add(n))
+        }
+        &Step::Plane((a, n), _) => reads(a, a.saturating_add(n)),
+        Step::Host(_, (a, b)) => reads(*a, *b),
+        Step::Run(_) => true,
+        Step::Placed(other) => writes(other.dst, other.dst.saturating_add(other.len))
+            || reads(other.src, other.src.saturating_add(other.len)),
+        Step::Refresh(s, a, n) | Step::GpuWrite(s, a, n) =>
+            !std::sync::Arc::ptr_eq(s, &p.shadow) && reads(*a, a.saturating_add(*n)),
+    }
+}
+
+/// Transfer only already-recorded native copies of ordinary registered
+/// private memory. Physical-page views, overlapping operands, other
+/// backings and unknown CPU consumers retain eager mirroring. In-flight
+/// conflicts still use the existing exact relay path.
+pub(super) fn plan_ownership(runs: &[&HostList], air: &[(usize, usize)]) -> Vec<Owned> {
+    if !ownership_on() || !relay_exact() || card_steps::stage() < 2 { return Vec::new(); }
+    let mut owned = Vec::new();
+    for list in runs {
+        let list_key = std::ptr::from_ref(*list) as usize;
+        // Never hold a Deferred lock while acquiring another (a list can
+        // appear more than once in a submission).
+        let candidates: Vec<_> = {
+            let deferred = list.deferred();
+            deferred.copies.iter().enumerate().filter_map(|(i, s)| {
+                let Step::Placed(p) = s else { return None; };
+                let source = p.source.as_ref()?;
+                if p.len < (1 << 20) || p.from.is_some() || !p.shadow.carded()
+                    || !source.carded() || std::sync::Arc::ptr_eq(source, &p.shadow)
+                    || overlaps((p.src, p.src.saturating_add(p.len)), (p.dst, p.dst.saturating_add(p.len)))
+                    || touches(air, p.src, p.src.saturating_add(p.len))
+                    || touches(air, p.dst, p.dst.saturating_add(p.len)) { return None; }
+                Some((i, Placed { dst: p.dst, src: p.src, len: p.len, shadow: p.shadow.clone(),
+                    from: None, source: p.source.clone() }))
+            }).collect()
+        };
+        for (i, p) in candidates {
+            OWNED_STATS[0].fetch_add(1, Ordering::Relaxed);
+            if owned.len() >= 8 { return owned; }
+            if runs.iter().filter(|l| std::ptr::from_ref(**l) as usize == list_key).count() != 1
+                || !crate::inplace::private_whole(p.src, p.len)
+                || !crate::inplace::private_whole(p.dst, p.len)
+                || !crate::shadow::peek(p.dst as u64, p.len as u64).is_some_and(|s| std::sync::Arc::ptr_eq(&s, &p.shadow))
+                || !crate::shadow::peek(p.src as u64, p.len as u64).is_some_and(|s| p.source.as_ref().is_some_and(|f| std::sync::Arc::ptr_eq(&s, f)))
+            { continue; }
+            if runs.iter().any(|other| {
+                let other_key = std::ptr::from_ref(*other) as usize;
+                other.deferred().copies.iter().enumerate().any(|(j, step)| {
+                    (other_key != list_key || j != i) && conflicts(step, &p)
+                })
+            }) { continue; }
+            OWNED_STATS[1].fetch_add(1, Ordering::Relaxed);
+            OWNED_STATS[2].fetch_add(p.len as u64, Ordering::Relaxed);
+            owned.push(Owned { list: list_key, step: i, shadow: p.shadow, from: p.dst, to: p.dst + p.len });
+        }
+    }
+    owned
+}
+
+#[cfg(test)]
+#[test]
+fn ownership_intervals_are_half_open() {
+    assert!(!overlaps((0, 4), (4, 8)));
+    assert!(overlaps((0, 5), (4, 8)));
+    assert!(!overlaps((4, 4), (0, 8)));
 }
 
 /// Whether a copy waits for flights before its submission is prepared: not;
@@ -255,6 +367,7 @@ impl HostList {
             len,
             shadow: to,
             from: scratch.map(|s| s.2 as usize),
+            source: own,
         }));
         deferred.title_written();
         self.changed_something();

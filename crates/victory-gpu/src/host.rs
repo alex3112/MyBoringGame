@@ -3225,6 +3225,7 @@ struct Sent {
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
+    owned_placed: Vec<place::Owned>,
     /// Title-memory ranges written when its shader textures are copied back.
     texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
@@ -3244,6 +3245,7 @@ struct Flight {
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
+    owned_placed: Vec<place::Owned>,
     texture_back_ranges: Vec<(usize, usize)>,
 }
 
@@ -4282,6 +4284,8 @@ fn late_line(frames: f64) {
             t[3],
         );
     }
+    place::ownership_line(frames);
+    crate::shadow::dirty_card_line(frames);
     card_steps::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -5952,6 +5956,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
+                owned_placed: sent.owned_placed,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
@@ -6007,6 +6012,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
+                owned_placed: sent.owned_placed,
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
@@ -6384,6 +6390,11 @@ impl Host {
         split.part(1);
         // What flights in the air may write.
         let air = line().written.clone();
+        // Keep the existing planner's promoted copies and this ownership
+        // path separate until their dependency models are unified.
+        let owned_placed = if late && own.is_none() {
+            place::plan_ownership(runs, &air)
+        } else { Vec::new() };
         stage.next("submit: refreshes ahead of writes");
         if refresh_front() {
             batch.refresh_front(runs, &parts);
@@ -6392,7 +6403,9 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         for list in runs {
-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            let key = std::ptr::from_ref(*list) as usize;
+            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)),
+                |i| owned_placed.iter().any(|p| p.list == key && p.step == i));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -6509,6 +6522,7 @@ impl Host {
                 card,
                 back,
                 own,
+                owned_placed,
                 texture_back_ranges,
                 writes,
             };
@@ -8189,7 +8203,7 @@ impl HostList {
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
     /// card ([`card_steps`]).
-    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
+    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool, gpu_owned: impl Fn(usize) -> bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -8240,6 +8254,12 @@ impl HostList {
                     batch.fill();
                     if free {
                         batch.title_written();
+                    }
+                    if gpu_owned(i) {
+                        // The native copy is the writer. Do not copy its
+                        // CPU source or pre-update the CPU destination.
+                        // GpuWrite already declared the readback range.
+                        continue;
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));

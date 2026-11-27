@@ -128,6 +128,8 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    // Weak self-identity installed before publishing a resident copy.
+    owner: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -344,6 +346,30 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+// One entry per dirty resource, not per write. A weak identity never
+// prolongs the lifetime of a retired resource or aliases a recycled ID.
+static DIRTY_CARDS: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+static DIRTY_CARD_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn dirty_queue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRTY_RESOURCE_QUEUE").is_none_or(|v| v != "0"))
+}
+
+fn register_card(shadow: &Arc<Shadow>) {
+    if let Some(card) = &shadow.card {
+        let weak = Arc::downgrade(shadow);
+        let _ = card.owner.set(weak.clone());
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(weak);
+    }
+}
+
+pub(crate) fn dirty_card_line(frames: f64) {
+    let [queued, visited, sent] = DIRTY_CARD_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("dirty resource queue per frame (VICTORY_DIRTY_RESOURCE_QUEUE={}): {:.0} queued, {:.0} examined, {:.0} sent",
+        u8::from(dirty_queue()), queued, visited, sent);
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -362,7 +388,11 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    {
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.retain(|w| w.strong_count() > 0);
+        out[7] = carded.len() as u64;
+    }
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -706,32 +736,39 @@ impl SentRuns {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
+    // Drop the queue lock before taking any individual dirty lock.
+    // Producers hold dirty first and then enqueue on the clean->dirty edge.
+    let candidates = if dirty_queue() {
+        std::mem::take(&mut *DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        let mut all = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|w| w.strong_count() > 0);
+        all.clone()
+    };
+    DIRTY_CARD_STATS[1].fetch_add(candidates.len() as u64, Ordering::Relaxed);
+    for weak in candidates {
+        let Some(shadow) = weak.upgrade() else { continue; };
+        let Some(card) = &shadow.card else { continue; };
+        if !card.touched.load(Ordering::Acquire) { continue; }
+        let ranges = {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            // Clear under the same lock as insertion. A producer racing
+            // this take either belongs to this version or enqueues anew.
+            card.touched.store(false, Ordering::Release);
+            let ranges = joined(std::mem::take(&mut *dirty));
+            if relay() {
+                let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.forget(fetched);
+                sent.note_joined(sent_as, ranges.clone());
+            }
+            ranges
         };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.forget(fetched);
-                    sent.note_joined(sent_as, ranges.clone());
-                }
-                ranges
-            })
-            .unwrap_or_default();
         if !ranges.is_empty() {
+            DIRTY_CARD_STATS[2].fetch_add(1, Ordering::Relaxed);
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -4458,7 +4495,12 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel) && dirty_queue()
+            && let Some(owner) = card.owner.get()
+        {
+            DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()).push(owner.clone());
+            DIRTY_CARD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4757,6 +4799,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                owner: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4914,6 +4957,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                owner: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5347,6 +5391,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                owner: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5372,7 +5417,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            register_card(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5582,10 +5627,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+                owner: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    register_card(&shadow);
     Some(shadow)
 }
 
@@ -5762,6 +5808,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                owner: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5780,7 +5827,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        register_card(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

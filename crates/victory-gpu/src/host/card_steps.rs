@@ -159,6 +159,7 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                     }
                 }
                 out.extend(flight.own.iter().flat_map(Taken::copied));
+                out.extend(flight.owned_placed.iter().map(placed_writer));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
                 shadow: None,
@@ -172,20 +173,25 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
     out
 }
 
+fn placed_writer(p: &super::place::Owned) -> Writer {
+    Writer { shadow: Some(p.shadow.clone()), from: p.from, to: p.to, copy: true }
+}
+
 /// The destinations of copies done here that have not landed.
 pub(super) fn copies(line: &Line) -> Vec<Writer> {
     if stage() < 2 {
         return Vec::new();
     }
     let flying = line.line.iter().filter_map(|l| match l {
-        Late::Run(flight) => flight.own.as_ref(),
+        Late::Run(flight) => Some(flight),
         _ => None,
     });
     let landing = line.landing.iter().filter(|w| w.copy).map(|w| Writer {
         shadow: w.shadow.clone(),
         ..*w
     });
-    flying.flat_map(Taken::copied).chain(landing).collect()
+    flying.flat_map(|f| f.own.iter().flat_map(Taken::copied)
+        .chain(f.owned_placed.iter().map(placed_writer))).chain(landing).collect()
 }
 
 /// Whether `runs` refresh another host copy of a destination in `copies`,
@@ -197,7 +203,7 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     }
     runs.iter().any(|list| {
         list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
+            Step::Refresh(shadow, at, len) | Step::GpuWrite(shadow, at, len) => copies
                 .iter()
                 .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
             Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
