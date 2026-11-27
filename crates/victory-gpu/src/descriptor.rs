@@ -202,7 +202,10 @@ fn sync_early() -> Option<std::time::Duration> {
 
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+type SyncRequests = (u64, u64, std::collections::VecDeque<Option<Vec<usize>>>);
+#[cfg(windows)]
+static SYNC_ROUNDS: (std::sync::Mutex<SyncRequests>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0, std::collections::VecDeque::new())), std::sync::Condvar::new());
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
@@ -210,9 +213,9 @@ static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::s
 pub(crate) struct SyncedHeaps(Option<u64>);
 
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+pub(crate) fn begin_sync_heaps(scope: Option<Vec<usize>>) -> SyncedHeaps {
     if !sync_aside() {
-        sync_heaps();
+        sync_heaps_scoped(scope.as_deref());
         return SyncedHeaps(None);
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -247,6 +250,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                         break;
                     }
                 }
+                let scope = if asked { r.2.pop_front().flatten() } else { None };
                 drop(r);
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
@@ -254,17 +258,18 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 });
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
-                let _ = std::panic::catch_unwind(sync_heaps);
+                let _ = std::panic::catch_unwind(|| sync_heaps_scoped(scope.as_deref()));
             }
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
     if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
-        sync_heaps();
+        sync_heaps_scoped(scope.as_deref());
         return SyncedHeaps(None);
     }
     let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
     rounds.0 += 1;
+    rounds.2.push_back(scope);
     let mine = rounds.0;
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
@@ -296,8 +301,21 @@ impl Drop for SyncedHeaps {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn sync_heaps() {
+    sync_heaps_scoped(None);
+}
+
+#[cfg(windows)]
+static SCOPE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+fn scoped_heaps() -> bool {
+    crate::toggled!("VICTORY_DESCRIPTOR_DEPENDENCIES")
+}
+
+#[cfg(windows)]
+fn sync_heaps_scoped(scope: Option<&[usize]>) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return;
@@ -311,6 +329,20 @@ pub(crate) fn sync_heaps() {
     let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
+    // A full maintenance pass at least once per frame also keeps the
+    // texture/descriptor bookkeeping of currently unused heaps moving.
+    // Later rounds do not touch their write journals or waiting queues.
+    // None means the original full scan, including speculative rounds.
+    static LAST_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let scope = if scoped_heaps() && LAST_FULL.load(Relaxed) == frame {
+        scope
+    } else { None };
+    if scope.is_none() {
+        LAST_FULL.store(frame, Relaxed);
+        SCOPE_STATS[0].fetch_add(1, Relaxed);
+    } else {
+        SCOPE_STATS[1].fetch_add(1, Relaxed);
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -320,6 +352,12 @@ pub(crate) fn sync_heaps() {
         else {
             continue;
         };
+        let native = windows::core::Interface::as_raw(&host.heap) as usize;
+        if scope.is_some_and(|ids| ids.binary_search(&native).is_err()) {
+            SCOPE_STATS[3].fetch_add(1, Relaxed);
+            continue;
+        }
+        SCOPE_STATS[2].fetch_add(1, Relaxed);
         let step = u64::from(step);
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
@@ -584,6 +622,10 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     host::lifetime_line(frames);
+    let [full, scoped, visited, skipped] = SCOPE_STATS.each_ref()
+        .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!("descriptor dependencies per frame (VICTORY_DESCRIPTOR_DEPENDENCIES={}): {:.1} full rounds, {:.1} scoped rounds, {:.1} heaps processed, {:.1} heaps skipped",
+        u8::from(scoped_heaps()), full, scoped, visited, skipped);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(

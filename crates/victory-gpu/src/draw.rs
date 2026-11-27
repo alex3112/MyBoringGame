@@ -1809,6 +1809,7 @@ impl State {
                 }
                 let title_heap = crate::descriptor::heap(h as This);
                 if let Some(host_heap) = title_heap.host() {
+                    list.keep_descriptor_heap(&host_heap.heap);
                     if title_heap.samplers() {
                         sampler_heap = Some(host_heap.heap.clone());
                     } else {

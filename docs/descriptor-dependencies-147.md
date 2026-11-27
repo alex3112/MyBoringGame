@@ -1,0 +1,7 @@
+# Build 0.147 — descriptor submission dependencies (heap granularity)
+
+Each native recording now remembers the native identities of title shader-visible heaps it actually binds. Existing retained native interfaces keep these identities alive. At submission the dependency set is the union of current lists and outstanding flights, not the entire registry. The synchronization worker receives the exact request in its FIFO; no writes or aged waiting slots of excluded heaps are consumed. If flights are being landed outside the visible line, or this is the first round in a frame, retain the previous full scan. Speculative rounds remain full. Internal pass heaps do not require title record synchronization.
+
+All slots in every selected heap are still processed exactly as before, including unknown/dynamically indexed descriptors. This is intentionally not per-slot dependency tracking: shader access ranges are not yet proven complete. A skipped heap's records are picked up when the heap is next needed or in the next full maintenance pass. This does not claim that the prologue has enough distinct heaps to yield a significant performance gain.
+
+Switch: VICTORY_DESCRIPTOR_DEPENDENCIES=0 restores full scans. New log line: descriptor dependencies per frame (full/scoped rounds, processed/skipped heaps). No shader, memory ownership, or GPU fence semantics intentionally changed. Static source verification only; Windows compilation and game performance not verified.

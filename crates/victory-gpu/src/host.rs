@@ -2713,6 +2713,9 @@ struct Deferred {
     /// Canonical IUnknown identities already held by keep(); pointers
     /// cannot be reused while the retained IUnknown is alive.
     kept_interfaces: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Shader-visible title heaps actually bound by this native recording.
+    /// Their native interfaces are also retained in kept.
+    descriptor_heaps: Vec<usize>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3221,6 +3224,7 @@ type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
 struct Sent {
     /// Its number among the submissions started.
     number: u64,
+    descriptor_heaps: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
@@ -3239,6 +3243,7 @@ struct Flight {
     number: u64,
     /// The value signalled on the host's fence behind it.
     fence: u64,
+    descriptor_heaps: Vec<usize>,
     lists: Vec<crate::list::Detached>,
     order: Vec<usize>,
     card: Option<CardPlan>,
@@ -5954,6 +5959,7 @@ impl Host {
                 fence: *target,
                 lists,
                 order,
+                descriptor_heaps: sent.descriptor_heaps,
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
@@ -6010,6 +6016,7 @@ impl Host {
                 fence: *target,
                 lists: Vec::new(),
                 order: Vec::new(),
+                descriptor_heaps: sent.descriptor_heaps,
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
@@ -6274,7 +6281,31 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        let mut descriptor_heaps: Vec<usize> = runs.iter()
+            .flat_map(|l| l.deferred().descriptor_heaps.clone()).collect();
+        descriptor_heaps.sort_unstable();
+        descriptor_heaps.dedup();
+        // Keep all title heaps used by already submitted work in the
+        // scope as well. If the relay has taken flights out of LINE,
+        // their exact heap dependencies are not visible here: fail open
+        // to the original full pass. Do not hold LINE during heap sync.
+        let heap_scope = {
+            let line = line();
+            if line.settling {
+                None
+            } else {
+                let mut scope = descriptor_heaps.clone();
+                for item in &line.line {
+                    if let Late::Run(flight) = item {
+                        scope.extend_from_slice(&flight.descriptor_heaps);
+                    }
+                }
+                scope.sort_unstable();
+                scope.dedup();
+                Some(scope)
+            }
+        };
+        let heaps_synced = crate::descriptor::begin_sync_heaps(heap_scope);
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -6520,6 +6551,7 @@ impl Host {
             crate::copystat::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
+                descriptor_heaps,
                 card,
                 back,
                 own,
@@ -8122,6 +8154,16 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// Called only when binding a title heap, not an internal pass heap.
+    pub(crate) fn keep_descriptor_heap(&self, heap: &ID3D12DescriptorHeap) {
+        let key = heap.as_raw() as usize;
+        self.keep(heap);
+        let mut d = self.deferred();
+        if !d.descriptor_heaps.contains(&key) {
+            d.descriptor_heaps.push(key);
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
