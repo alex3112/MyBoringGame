@@ -430,6 +430,9 @@ impl Work for Job {
         let Job::Lists(queue, recordings) = self else {
             return vec![self];
         };
+        for recording in recordings.iter() {
+            crate::timeline::mark("recording unfolded", recording.trace_id(), queue as u64);
+        }
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
         let jobs = jobs_of(queue as This, &lists);
         // It stood for one submission not begun.
@@ -741,6 +744,9 @@ pub(super) fn submit(this: This, lists: &[This]) {
         let before = QUEUED.fetch_add(1, Relaxed);
         STATS[DEPTH].fetch_add(before, Relaxed);
         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
+        for recording in recordings.iter() {
+            crate::timeline::mark("recording submitted", recording.trace_id(), queue as u64);
+        }
         LANE.push(queue, [Job::Lists(queue, recordings)]);
         room(before + 1);
         return;

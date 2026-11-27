@@ -30,7 +30,7 @@ mod report;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use hooks::import;
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use record::{Span, span};
+pub use record::{Span, span, span_id, mark};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use record::{called, card_wait, on, polled, presented, sent, ticks, title_thread, told};
 
@@ -55,3 +55,13 @@ impl Span {
 pub fn span(_name: &'static str) -> Span {
     Span
 }
+
+/// A diagnostic span correlated with a command recording.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[inline(always)]
+pub fn span_id(_name: &'static str, _id: u64, _value: u64) -> Span { Span }
+
+/// A diagnostic milestone, without a duration.
+#[cfg(not(all(windows, feature = "diagnostics")))]
+#[inline(always)]
+pub fn mark(_name: &'static str, _id: u64, _value: u64) {}

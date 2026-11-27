@@ -14,6 +14,8 @@ pub(super) struct Threads {
     /// The processor's clock and the performance counter then.
     cycles: u64,
     ticks: u64,
+    // Page faults include soft faults; they do not prove disk paging.
+    memory: Option<(u32, u64, u64)>,
 }
 
 #[link(name = "kernel32")]
@@ -78,6 +80,17 @@ impl Threads {
             }
             CloseHandle(snapshot);
             threads.cycles = std::arch::x86_64::_rdtsc();
+        }
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut counters = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        let mut memory = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        // SAFETY: valid output buffers, current process only.
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } != 0
+            && unsafe { GlobalMemoryStatusEx(&mut memory) } != 0
+        {
+            threads.memory = Some((counters.PageFaultCount, counters.WorkingSetSize as u64, memory.ullAvailPhys));
         }
         threads.ticks = super::record::ticks();
         threads
@@ -295,7 +308,7 @@ impl Trace {
                     trace.spans.entry(e.thread).or_default().push(i);
                 }
                 Kind::Frame => trace.frames.push((e.t1, e.thread)),
-                Kind::Told | Kind::Poll | Kind::Sample => {}
+                Kind::Told | Kind::Poll | Kind::Sample | Kind::Marker => {}
             }
         }
         for waits in trace.waits.values_mut() {
@@ -506,6 +519,12 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
     };
     let _ = writeln!(text, "{} frames in {:.1} ms ({:.1} ms a frame); {} events", frames, ms(stop - start), ms(stop - start) / frames, trace.events.len());
 
+    if let (Some((fault0, ws0, avail0)), Some((fault1, ws1, avail1))) = (before.memory, after.memory) {
+        let _ = writeln!(text, "\nprocess memory across capture: {} page faults (soft + hard, not disk reads), working set {:.1} -> {:.1} MiB, physical available {:.1} -> {:.1} MiB",
+            fault1.wrapping_sub(fault0), ws0 as f64 / 1048576.0, ws1 as f64 / 1048576.0,
+            avail0 as f64 / 1048576.0, avail1 as f64 / 1048576.0);
+    }
+
     // The chains.
     let mut all: Vec<Part> = Vec::new();
     for pair in trace.frames.windows(2) {
@@ -538,6 +557,32 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
 
     // The card.
     let runs: Vec<&Run> = trace.runs.iter().filter(|r| r.on != (0, 0) && r.on.1 > start && r.on.0 < stop).collect();
+    let relevant = trace.runs.iter().filter(|r| r.t1 >= start && r.t0 < stop).count();
+    let stamped = trace.runs.iter().filter(|r| r.t1 >= start && r.t0 < stop && r.on.0 != 0 && r.on.1 >= r.on.0).count();
+    let _ = writeln!(text, "\nGPU timestamp coverage: {stamped}/{relevant} CPU submissions in capture; only the instrumented direct-queue intervals, not full GPU utilization or copy-queue activity.");
+    // Partition the gaps between consecutive stamped direct submissions.
+    // A gap before the next ExecuteCommandLists call cannot be caused by
+    // that submission executing slowly; gaps after the call are not assigned
+    // a CPU cause. Boundaries and missing stamps remain unclassified.
+    let mut ordered = runs.clone();
+    ordered.sort_by_key(|r| r.on.0);
+    let mut previous: Option<u64> = None;
+    let (mut pre, mut api, mut post) = (0u64, 0u64, 0u64);
+    for r in ordered {
+        let a = r.on.0.clamp(start, stop);
+        let z = r.on.1.clamp(start, stop);
+        if let Some(end) = previous && a > end {
+            let call = r.t0.clamp(end, a);
+            let returned = r.t1.clamp(call, a);
+            pre += call - end;
+            api += returned - call;
+            post += a - returned;
+        }
+        previous = Some(previous.map_or(z, |end| end.max(z)));
+    }
+    let _ = writeln!(text, "inter-stamp gaps per frame ({}): {:.2} ms before next CPU submit call, {:.2} ms inside call, {:.2} ms after call returned; no claim about other GPU queues",
+        if stamped == relevant && relevant > 0 { "direct stamps present" } else { "INCOMPLETE; gaps may contain unstamped submissions" },
+        ms(pre)/frames, ms(api)/frames, ms(post)/frames);
     let (mut busy, mut reach) = (0, start);
     let mut idle: BTreeMap<String, u64> = BTreeMap::new();
     let mut idle_all = 0;
@@ -644,6 +689,31 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
         );
     }
 
+    // Each recording is uniquely numbered for the launch; partial records
+    // at either capture boundary are explicitly excluded from the latency.
+    let mut queued = HashMap::<u64, u64>::new();
+    let mut done = HashMap::<u64, u64>::new();
+    let mut unfolded = HashMap::<u64, u64>::new();
+    for e in trace.events.iter().filter(|e| e.kind == Kind::Marker && e.t0 >= start && e.t0 <= stop) {
+        match e.name {
+            "recording submitted" => { queued.entry(e.a).or_insert(e.t0); }
+            "recording translated" => { done.insert(e.a, e.t0); }
+            "recording unfolded" => { unfolded.insert(e.a, e.t0); }
+            _ => {}
+        }
+    }
+    let mut delays: Vec<_> = queued.iter().filter_map(|(&id, &at)| {
+        let end = *unfolded.get(&id)?;
+        let ready = done.get(&id).copied();
+        Some((id, end.saturating_sub(at), ready.map(|t| t.saturating_sub(at)), ready.map(|t| end.saturating_sub(t.max(at)))))
+    }).collect();
+    delays.sort_by_key(|d| std::cmp::Reverse(d.1));
+    let _ = writeln!(text, "\nrecording dependencies: {} matched submit/unfold pairs of {} submitted in capture; durations overlap, do not sum them", delays.len(), queued.len());
+    for (id, total, translate, lane) in delays.into_iter().take(30) {
+        let fmt = |t: Option<u64>| t.map_or("outside capture".to_string(), |t| format!("{:.2} ms", ms(t)));
+        let _ = writeln!(text, "  recording {id}: submit -> unfold {:.2} ms, submit -> translated {}, translated -> unfold {}", ms(total), fmt(translate), fmt(lane));
+    }
+
     // Long list calls.
     let mut calls: HashMap<String, (u64, u64)> = HashMap::new();
     for e in trace.events.iter().filter(|e| e.name == "a long list call" && e.t1 > start && e.t0 < stop) {
@@ -718,6 +788,7 @@ pub(super) fn chrome(
                 )?;
             }
             Kind::Frame => write!(out, ",\n{{\"ph\":\"i\",\"s\":\"g\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"name\":\"a frame ends\"}}")?,
+            Kind::Marker => write!(out, ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"recording\",\"name\":\"{}\",\"args\":{{\"recording\":{},\"value\":{}}}}}", escaped(e.name), e.a, e.b)?,
             Kind::Wait => {
                 let site = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(String::new(), |s| names.site(s));
                 write!(

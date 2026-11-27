@@ -34,6 +34,8 @@ pub(super) enum Kind {
     /// Where a thread of the title's was: `a` the instruction, the stack
     /// what on its stack may be return addresses.
     Sample,
+    /// A correlated command recording milestone.
+    Marker,
 }
 
 /// The `b` of a wait for the card's copy queue.
@@ -171,14 +173,28 @@ pub struct Span {
     name: &'static str,
     /// When it began (0: nothing is recorded).
     began: u64,
+    id: u64,
+    value: u64,
 }
 
 /// A span named `name`.
 #[inline(always)]
 pub fn span(name: &'static str) -> Span {
-    Span {
-        name,
-        began: if on() { ticks() } else { 0 },
+    span_id(name, 0, 0)
+}
+
+/// Correlate work and waits with one recording ID.
+#[inline(always)]
+pub fn span_id(name: &'static str, id: u64, value: u64) -> Span {
+    Span { name, began: if on() { ticks() } else { 0 }, id, value }
+}
+
+/// Correlate a producer and consumer without tracing every list call.
+#[inline(always)]
+pub fn mark(name: &'static str, id: u64, value: u64) {
+    if on() {
+        let t = ticks();
+        put(Kind::Marker, name, (t, t), id, value, 0);
     }
 }
 
@@ -199,7 +215,7 @@ impl Span {
         if began != 0 {
             let now = ticks();
             if micros(now - began) >= SHORTEST {
-                put(Kind::Span, self.name, (began, now), 0, 0, 0);
+                put(Kind::Span, self.name, (began, now), self.id, self.value, 0);
             }
         }
     }
@@ -443,6 +459,8 @@ struct Asked {
     after: Vec<f64>,
     frames: u64,
     started: std::time::Instant,
+    manual: bool,
+    sample_threads: bool,
 }
 
 /// `<from s>[+<from s>..],<frames>,<file>`, or a file alone.
@@ -468,17 +486,25 @@ fn asked() -> Option<&'static Asked> {
             let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok());
             let text = file.to_string_lossy();
             let (when, file) = parse(&text);
+            let manual = std::env::var_os("VICTORY_TIMELINE_MANUAL").is_some_and(|v| v == "1");
             let (after, frames) = when.unwrap_or_else(|| {
                 (
                     vec![number("VICTORY_TIMELINE_AT").unwrap_or(60.0)],
-                    number("VICTORY_TIMELINE_FRAMES").map_or(3, |n| n as u64),
+                    number("VICTORY_TIMELINE_FRAMES").map_or(if manual { 6 } else { 3 }, |n| n as u64),
                 )
             });
+            let after = if manual { vec![0.0] } else { after };
+            // The old sampler suspends title threads and busy-spins at 4 kHz.
+            // Keep it off by default for a minimally intrusive manual capture.
+            let sample_threads = std::env::var_os("VICTORY_TIMELINE_SAMPLE")
+                .map_or(!manual, |v| v != "0");
             Some(Asked {
                 file: file.into(),
                 after,
                 frames: frames.clamp(1, 60),
                 started: std::time::Instant::now(),
+                manual,
+                sample_threads,
             })
         })
         .as_ref()
@@ -517,8 +543,16 @@ pub(crate) fn presented() {
     let Some(&after) = asked.after.get(stage.made) else {
         return;
     };
-    if stage.writing || asked.started.elapsed().as_secs_f64() < after {
+    if stage.writing || (!asked.manual && asked.started.elapsed().as_secs_f64() < after) {
         return;
+    }
+    if asked.manual && !stage.ready {
+        // Poll at the title's presents; hold F9 until the armed line appears.
+        // SAFETY: plain keyboard-state query, no hook or input consumption.
+        if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x78) } >= 0 {
+            return;
+        }
+        tracing::info!("F9: preparing critical-path timeline");
     }
     if !stage.ready {
         // The buffers, the card's lists and the threads' clocks take a
@@ -531,9 +565,9 @@ pub(crate) fn presented() {
     if !stage.began {
         stage.began = true;
         stage.before = Some(super::report::Threads::now());
-        tracing::info!(file = %asked.file.display(), frames = asked.frames, "the timeline begins (VICTORY_TIMELINE)");
+        tracing::info!(file = %asked.file.display(), frames = asked.frames, sample_threads = asked.sample_threads, "the timeline begins (VICTORY_TIMELINE)");
         begin();
-        if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
+        if asked.sample_threads && std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
             tracing::warn!("the timeline is without samples of the title's threads");
         }
         frame();

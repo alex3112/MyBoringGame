@@ -144,6 +144,7 @@ impl Front {
             !std::mem::replace(&mut inner.scheduled, true)
         };
         if schedule {
+            crate::timeline::mark("recording queued for worker", recording.id, 0);
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
@@ -200,6 +201,7 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// One recording of a title list: what was written of it and not translated
 /// yet, and the list of ours it goes to.
 pub(crate) struct Recording {
+    id: u64,
     kind: u32,
     inner: Mutex<Inner>,
     /// Translated to its end.
@@ -223,7 +225,9 @@ struct Inner {
 
 impl Recording {
     fn new(kind: u32) -> Self {
+        static NEXT_RECORDING: AtomicU64 = AtomicU64::new(1);
         Recording {
+            id: NEXT_RECORDING.fetch_add(1, Relaxed),
             kind,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
@@ -232,12 +236,15 @@ impl Recording {
         }
     }
 
+    pub(crate) fn trace_id(&self) -> u64 { self.id }
+
     pub(crate) fn done(&self) -> bool {
         self.done.load(Acquire)
     }
 
     /// Waits until it is translated.
     pub(crate) fn wait(&self) {
+        let _wait = crate::timeline::span_id("waiting for recording translation", self.id, 0);
         let mut inner = held(&self.inner);
         while !self.done() {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
@@ -251,6 +258,7 @@ impl Recording {
 
     /// Translates what there is.
     fn run(&self) {
+        let _job = crate::timeline::span_id("recording worker job", self.id, 0);
         loop {
             let (chunk, back) = {
                 let mut inner = held(&self.inner);
@@ -264,7 +272,9 @@ impl Recording {
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
+            let translating = crate::timeline::span_id("translating recording chunk", self.id, chunk.len() as u64);
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            translating.end();
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -272,6 +282,7 @@ impl Recording {
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
+                crate::timeline::mark("recording translated", self.id, 0);
                 self.done.store(true, Release);
                 self.moved.notify_all();
                 drop(inner);
