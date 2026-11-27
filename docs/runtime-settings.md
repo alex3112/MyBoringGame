@@ -1,9 +1,32 @@
-# Runtime graphics settings (build 0.128)
+# Native FSR 3.1 integration, stage 1 (build 0.129)
 
-Press **²** (the key left of 1 on AZERTY, grave on US layout) in the game window. Click the values to cycle between options. Press ² again, Escape, or Close to return to the title. This is an owned native Windows settings window; it is not composited into the game swap chain.
+AFMF and ADLX have been removed. The port does not change any AMD driver setting.
+The menu (key ²) is retained. The Frame Generation control is explicitly disabled:
+no interpolation runs in this build. A provider probe uses the native AMD
+FidelityFX API (SDK 1.1.4) against the actual host D3D12 device, if the
+official amd_fidelityfx_dx12.dll is beside victory.exe. The SDK is not
+redistributed by this repository. Checking it does not allocate a frame
+generation context or change the swapchain.
 
-The AMD Fluid Motion Frames control uses the official ADLX driver API. It does not implement FSR 3's motion-vector/depth-based interpolation pipeline. No extra SDK is needed at build time; ADLX is loaded only when the menu is opened, from Windows System32. Unsupported controls are disabled. The driver determines actual interpolation, including application-specific overrides, presentation conditions and availability; On reflects the driver setting, not proof of generated frames. Driver-level frame counts are not included in the existing native FPS metric.
+In a diagnostics build, open the settings menu in controllable 3D gameplay
+and click Capture FSR inputs. The menu closes and schedules target dumps
+32 and 40 native presents later. Slowly pan the camera after clicking.
+The capture folder is fsr-input-audit-<pid> in the working directory
+(or VICTORY_CAPTURE if set). It includes target descriptions, existing PNG
+previews and the frame's recorded operations. Dumps are expensive and are
+not a benchmark. No captures run unless explicitly requested or previous
+capture flags are used. The existing diagnostic target collector may not
+observe all targets in deferred/behind submission paths; check logs and
+the number of candidates before interpreting the result. Resource addresses
+are session-local, not stable identifiers.
 
-**These are global AMD driver settings, not VIctory-only settings.** Opening the menu changes nothing. Clicking a setting changes the driver profile and can affect other applications; values may survive process exit. Restore initial settings explicitly to restore the values observed at the first successful connection. No automatic changes are made on startup or exit. The menu thread keeps the renderer independent of driver requests. Low native frame rates (such as 13 FPS) may produce visible artifacts and increased latency even when AFMF engages.
+The next integration stage requires identifying the depth and motion-vector
+producer passes and encodings, render resolution, jitter, camera projection
+and reset conditions. The SDK's prepare call cannot use guessed textures.
+Then create a frame-generation context and swapchain, configure/prepare each
+native frame, register HUD composition as appropriate and measure native and
+generated presents separately. No placeholder frames or duplicate presents
+are implemented.
 
-AMD references: https://gpuopen.com/manuals/adlx/adlx-sdk-references/adlx-interfaces/3d-graphics/iadlx3damdfluidmotionframes/ and https://github.com/GPUOpen-LibrariesAndSDKs/ADLX (public ABI declarations in SDK/Include/ISystem.h, I3DSettings1.h and I3DSettings3.h).
+References: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4
+and https://gpuopen.com/manuals/fidelityfx_sdk/techniques/super-resolution-interpolation/

@@ -4221,7 +4221,7 @@ mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
-mod afmf;
+mod fidelityfx;
 mod settings_menu;
 mod place;
 mod send;

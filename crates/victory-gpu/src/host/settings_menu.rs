@@ -1,6 +1,5 @@
 //! An owned Win32 settings window, with a separate message thread so no
-//! driver call or UI event runs under the D3D12 presenter lock.
-use super::afmf::{Afmf, N, OPTIONS};
+//! SDK query or UI event runs under the D3D12 presenter lock.
 use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
@@ -12,19 +11,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const ROWS: [&str; N] = [
-    "Frame generation (AFMF)",
-    "Algorithm",
-    "Search mode",
-    "Performance mode",
-    "Fast motion response",
-];
-const FIRST: usize = 100;
 const CLOSE: usize = 200;
-const REFRESH: usize = 201;
-const RESTORE: usize = 202;
+const PROBE: usize = 201;
+const CAPTURE: usize = 202;
 const WIDTH: i32 = 610;
-const HEIGHT: i32 = 414;
+const HEIGHT: i32 = 320;
 
 thread_local! {
     static COMMAND: Cell<usize> = const { Cell::new(0) };
@@ -81,10 +72,7 @@ fn label(hwnd: HWND, text: &str) {
 
 struct Menu {
     hwnd: HWND,
-    buttons: [HWND; N],
     status: HWND,
-    restore: HWND,
-    session: Option<Afmf>,
 }
 
 impl Menu {
@@ -109,94 +97,46 @@ impl Menu {
         if hwnd.is_null() {
             return None;
         }
-        control(hwnd, "STATIC", "GRAPHICS / AMD FRAME GENERATION", 0, [18, 12, 550, 22]);
-        control(hwnd, "STATIC",
-            "Global AMD driver profile. Changes persist and may affect other games.",
-            0, [18, 38, 560, 22]);
-        let mut buttons = [null_mut(); N];
-        for i in 0..N {
-            let y = 70 + 37 * i as i32;
-            control(hwnd, "STATIC", ROWS[i], 0, [18, y + 6, 260, 24]);
-            buttons[i] = control(hwnd, "BUTTON", "Unavailable", FIRST + i, [290, y, 275, 30]);
-        }
-        let status = control(hwnd, "STATIC", "", 0, [18, 260, 560, 48]);
-        let restore = control(hwnd, "BUTTON", "Restore initial settings", RESTORE, [18, 318, 200, 30]);
-        control(hwnd, "BUTTON", "Refresh", REFRESH, [230, 318, 145, 30]);
-        control(hwnd, "BUTTON", "Close", CLOSE, [390, 318, 175, 30]);
-        if status.is_null() || restore.is_null() || buttons.iter().any(|b| b.is_null()) {
+        control(hwnd, "STATIC", "GRAPHICS / AMD FIDELITYFX FRAME GENERATION", 0, [18, 12, 550, 22]);
+        control(hwnd, "STATIC", "FSR 3.1 native frame generation (VIctory only)", 0, [18, 42, 550, 22]);
+        let generation = control(hwnd, "BUTTON", "Off - inputs not mapped", 0, [18, 68, 550, 32]);
+        unsafe { EnableWindow(generation, 0) };
+        let status = control(hwnd, "STATIC",
+            "Native interpolation is not active. First identify depth and motion vectors, then connect the presentation pipeline.",
+            0, [18, 113, 550, 68]);
+        control(hwnd, "BUTTON", "Check FidelityFX SDK", PROBE, [18, 193, 230, 32]);
+        let capture = control(hwnd, "BUTTON", "Capture FSR inputs", CAPTURE, [258, 193, 310, 32]);
+        unsafe { EnableWindow(capture, i32::from(cfg!(feature = "diagnostics"))) };
+        control(hwnd, "BUTTON", "Close", CLOSE, [390, 236, 178, 30]);
+        if status.is_null() || generation.is_null() || capture.is_null() {
             unsafe { DestroyWindow(hwnd) };
             return None;
         }
-        Some(Self { hwnd, buttons, status, restore, session: None })
+        Some(Self { hwnd, status })
     }
 
-    fn refresh(&mut self, connect: bool, message: Option<&str>) {
-        if connect && self.session.is_none() {
-            match Afmf::connect() {
-                Ok(session) => self.session = Some(session),
-                Err(e) => {
-                    tracing::warn!(error = %e, "AMD AFMF unavailable");
-                    label(self.status, &e);
-                }
+    /// True means the menu should close immediately so the requested
+    /// capture samples the game, rather than a window with no input focus.
+    fn command(&self, id: usize) -> bool {
+        match id {
+            PROBE => {
+                let text = match super::fidelityfx::probe() {
+                    Ok(versions) => format!("FidelityFX providers: {versions}. Interpolation still off; inputs not mapped."),
+                    Err(e) => e,
+                };
+                label(self.status, &text);
             }
+            #[cfg(feature = "diagnostics")]
+            CAPTURE => match crate::capture::request_fsr() {
+                Ok(()) => return true,
+                Err(e) => label(self.status, &e),
+            },
+            _ => {}
         }
-        let state = self.session.as_ref().map_or([None; N], Afmf::read);
-        for (i, value) in state.into_iter().enumerate() {
-            let caption = value.map_or("Unavailable", |v| OPTIONS[i][v as usize]);
-            label(self.buttons[i], caption);
-            unsafe { EnableWindow(self.buttons[i], i32::from(value.is_some())) };
-        }
-        unsafe { EnableWindow(self.restore, i32::from(self.session.is_some())) };
-        if let Some(message) = message {
-            label(self.status, message);
-        } else if self.session.is_some() {
-            label(self.status, "Click a value to cycle. On = driver setting, not confirmed interpolation. Low native FPS may cause artifacts.");
-        }
+        false
     }
 
-    fn command(&mut self, id: usize) {
-        if id == REFRESH {
-            self.refresh(true, None);
-            return;
-        }
-        let Some(session) = self.session.as_ref() else { return; };
-        let result = if (FIRST..FIRST + N).contains(&id) {
-            let row = id - FIRST;
-            let Some(current) = session.read()[row] else { return; };
-            let next = (current + 1) % OPTIONS[row].len() as i32;
-            session.set(row, next).and_then(|()| {
-                if session.read()[row] == Some(next) { Ok(()) }
-                else { Err("Driver did not confirm the requested setting. Refresh or check Adrenalin.".into()) }
-            })
-        } else if id == RESTORE {
-            // Restore advanced options before the initial on/off state.
-            let mut result = Ok(());
-            for row in [1, 2, 3, 4, 0] {
-                if let Some(value) = session.original[row]
-                    && session.read()[row] != Some(value)
-                    && let Err(e) = session.set(row, value)
-                {
-                    result = Err(e);
-                }
-            }
-            if result.is_ok() && session.read() != session.original {
-                result = Err("Driver did not confirm all initial settings".into());
-            }
-            result
-        } else {
-            return;
-        };
-        match result {
-            Ok(()) => self.refresh(false, Some("Driver settings confirmed. Return to the game to test AFMF.")),
-            Err(e) => {
-                tracing::warn!(error = %e, "AFMF settings change failed");
-                self.refresh(false, Some(&e));
-            }
-        }
-    }
-
-    fn show(&mut self, owner: HWND) {
-        self.refresh(true, None);
+    fn show(&self, owner: HWND) {
         let mut rect = RECT::default();
         if unsafe { GetWindowRect(owner, &mut rect) } != 0 {
             let x = rect.left + (rect.right - rect.left - WIDTH) / 2;
@@ -218,7 +158,7 @@ impl Menu {
 }
 
 fn run(owner: HWND) {
-    let Some(mut menu) = Menu::create(owner) else {
+    let Some(menu) = Menu::create(owner) else {
         tracing::warn!("could not create graphics settings window");
         return;
     };
@@ -262,8 +202,9 @@ fn run(owner: HWND) {
         } else if toggle {
             menu.show(owner);
             visible = true;
-        } else if visible && id != 0 {
-            menu.command(id);
+        } else if visible && id != 0 && menu.command(id) {
+            menu.hide(owner);
+            visible = false;
         }
         down = pressed;
         escape = esc_pressed;

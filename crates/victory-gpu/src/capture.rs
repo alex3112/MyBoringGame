@@ -10,10 +10,43 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
+    configured_folder().or_else(|| FSR_FOLDER.get())
+}
+
+fn configured_folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
         .as_ref()
+}
+
+static FSR_FOLDER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static FSR_FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const FSR_GAP: u64 = 8;
+
+fn fsr_listed(frame: u64) -> bool {
+    let first = FSR_FIRST.load(std::sync::atomic::Ordering::Acquire);
+    first != 0 && (frame == first || frame == first.saturating_add(FSR_GAP))
+}
+
+/// Called only by the UI thread, not by the renderer. Give the player time
+/// to close the menu and move the camera before taking two target dumps.
+pub(crate) fn request_fsr() -> Result<(), String> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let now = crate::queue::presented();
+    let previous = FSR_FIRST.load(Acquire);
+    if previous != 0 && now <= previous.saturating_add(FSR_GAP) {
+        return Err("A frame-input capture is already scheduled".into());
+    }
+    let dir = configured_folder().cloned().unwrap_or_else(|| {
+        PathBuf::from(format!("fsr-input-audit-{}", std::process::id()))
+    });
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create capture folder: {e}"))?;
+    let _ = FSR_FOLDER.set(dir);
+    let first = now.saturating_add(32);
+    FSR_FIRST.store(first, Release);
+    tracing::info!(first, second = first + FSR_GAP, folder = ?folder(), "FSR input audit scheduled; move camera after closing settings");
+    Ok(())
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -47,7 +80,7 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    fsr_listed(n) || named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -152,7 +185,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    folder().is_some() && (listed(n) || configured_folder().is_some() && (n.is_power_of_two() || before_world || in_world))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -363,7 +396,8 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    let frame = crate::queue::presented() + 1;
+    if resource.is_null() || (!fsr_listed(frame) && (!dump_on() || !listed(frame))) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
@@ -379,6 +413,24 @@ pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
+    let audit = fsr_listed(frame);
+    if audit {
+        tracing::info!(frame, targets = targets.len(), "FSR input audit: captured render targets");
+    }
+    if audit && let Some(folder) = folder() {
+        use std::fmt::Write as _;
+        let mut report = String::new();
+        for (i, (resource, copy)) in targets.iter().enumerate() {
+            let d = unsafe { copy.texture.GetDesc() };
+            let _ = writeln!(report, "{i:03} resource={resource:#x} {}x{} format={} flags={:#x} mips={} slices={} samples={} state={:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0, d.MipLevels, d.DepthOrArraySize, d.SampleDesc.Count, copy.state.load(Relaxed));
+        }
+        let path = folder.join(format!("frame-{frame}-fsr-inputs.txt"));
+        match std::fs::write(&path, report) {
+            Ok(()) => tracing::info!(frame, path = %path.display(), "FSR input audit inventory saved"),
+            Err(e) => tracing::warn!(frame, error = %e, "FSR input audit report failed"),
+        }
+    }
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
@@ -389,6 +441,9 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+    }
+    if audit {
+        tracing::info!(frame, "FSR input audit target dumps complete");
     }
 }
 
