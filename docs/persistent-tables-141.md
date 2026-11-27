@@ -1,0 +1,8 @@
+# Build 0.141 — persistent descriptor table templates
+
+The 0.140 run remained around 13–14 native FPS. This first structural change reduces native descriptor creation and calls to CopyDescriptorsSimple for stable buffer segments in fresh mixed tables, rather than tuning worker counts.
+
+A bounded per-translator CPU-only heap holds 128 templates of up to 64 slots, plus raw twins. Exact ordered record words and current registered Shadow IDs form the cache key; constant buffer slots and unsupported views are holes. Runs of at least four stable slots copy with one native call for normal descriptors and one for raw twins. Templates survive command-list recordings and frames. No template retains native resources; the destination still holds normal resource ownership and its original fence lifetime. Each use resolves the current descriptor generation and registered buffer mapping, excludes in-place/loose/exact allocations and misalignment, and on a miss validates the native resource returned by descriptor creation. Failed or unsupported runs use the existing path. Readiness is recording-local, and UAV access and per-list synchronization remain intact. CBVs still use fresh per-list scratch. Texture descriptors remain on their existing path because their backing/mip range can change.
+
+This is CPU-side template reuse, not reuse of a GPU-visible table across in-flight lists. No change to shader code, presentation, or game resolution. VICTORY_PERSISTENT_TABLES=0 restores the previous behavior. The normal log gives hits, builds, slots and contiguous runs per frame. A unit test covers run grouping and shadow identity changes; no Windows build or game benchmark was run here.
+

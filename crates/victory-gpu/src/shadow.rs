@@ -5261,6 +5261,23 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
+/// An existing registered buffer, for descriptor templates. Unlike find,
+/// this never creates a buffer or takes a loose/exact window. The fast
+/// answer has the same map generation checks as the normal lookup.
+pub(crate) fn template_registered(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if quick_find() && let Some(shadow) = found(address, len) {
+        return Some(shadow);
+    }
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers_read();
+    let shadow = map.range(..=(address, usize::MAX)).rev().take(64)
+        .find(|(_, e)| e.end >= end)?.1.shadow.as_ref()?;
+    if quick_find() {
+        remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+    }
+    Some(shadow.clone())
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {

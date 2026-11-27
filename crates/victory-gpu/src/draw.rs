@@ -4026,10 +4026,35 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            let template = host.copy_table_template(recording, table, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                if let Some(binding) = template.as_ref().and_then(|t| t[k as usize].as_ref()) {
+                    let kind = group.entry(k).map(|u| u.kind).or_else(|| {
+                        selected.binary_search(&k).ok().and_then(|_| view_kind(&binding.view))
+                    });
+                    if let Some(kind) = kind {
+                        let tested = TESTED_DEPTH.get();
+                        if kind == ResourceType::Srv
+                            && let Some((epoch, target, depth)) = binding.ready
+                            && epoch == list.epoch() && target == tested.0
+                        {
+                            if depth { TESTED_DEPTH.set((target, true)); }
+                        } else {
+                            let _ = crate::residency::take_staging_deferred();
+                            TESTED_DEPTH.set((tested.0, false));
+                            readable(list, kind, &binding.view);
+                            let depth = TESTED_DEPTH.get().1;
+                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                            if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
+                                binding.note_ready(recording, (list.epoch(), tested.0, depth));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views

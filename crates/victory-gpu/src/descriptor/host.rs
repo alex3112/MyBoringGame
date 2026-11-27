@@ -1078,6 +1078,9 @@ pub(super) fn lifetime_line(frames: f64) {
         u8::from(share_persistent_resources()), persistent[0], persistent[1]);
     tracing::info!("buffer-only descriptor fast path (VICTORY_HEAP_BUFFER_FAST={}): {:.0} updates per frame without texture locks",
         u8::from(fast_buffer_slots()), BUFFER_FAST.swap(0, Relaxed) as f64 / frames);
+    let templates = TEMPLATE_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("persistent descriptor table templates per frame (VICTORY_PERSISTENT_TABLES={}): {:.0} hits, {:.0} builds, {:.0} slots copied in {:.0} contiguous runs",
+        u8::from(persistent_tables()), templates[0], templates[1], templates[2], templates[3]);
     let waits = WAIT_DETAIL.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     let refs = DYNAMIC_REF_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     tracing::info!(
@@ -3102,6 +3105,106 @@ impl HostHeap {
             self.write_stride(index, made.stride_word);
             self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
+        })
+    }
+
+    /// Fill the stable runs of a mixed table from a persistent CPU-only
+    /// template. The caller handles all holes in original slot order and
+    /// performs normal per-recording resource preparation for these views.
+    pub(crate) fn copy_table_template(&self, recording: u64, table: u64, first: u32, n: u32) -> Option<Vec<Option<TemplateBinding>>> {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        if !persistent_tables() || self.sampler || !(8..=TEMPLATE_WIDTH).contains(&n) {
+            return None;
+        }
+        let mut bindings: Vec<_> = (0..n).map(|k| template_binding(table + u64::from(k) * 32)).collect();
+        let mut keys: Vec<_> = bindings.iter().map(|b| b.as_ref().map(|b| b.key)).collect();
+        let runs = template_runs(&keys);
+        if runs.is_empty() {
+            return None;
+        }
+        // Only the qualifying contiguous runs participate. In particular a
+        // constant changing on every dispatch does not change the key.
+        let mut covered = [false; TEMPLATE_WIDTH as usize];
+        for &(from, count) in &runs {
+            covered[from as usize..(from + count) as usize].fill(true);
+        }
+        for k in 0..n as usize {
+            if !covered[k] {
+                bindings[k] = None;
+                keys[k] = None;
+            }
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        keys.hash(&mut hash);
+        let entry = hash.finish() as usize % TEMPLATE_COUNT;
+        TABLE_TEMPLATES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.is_none() {
+                *cache = Some(TableTemplates::new()?);
+            }
+            let cache = cache.as_mut()?;
+            if cache.recording != recording {
+                cache.recording = recording;
+                cache.ready.clear();
+            }
+            let hit = cache.entries[entry].as_ref().is_some_and(|t| t.keys == keys);
+            if !hit {
+                // Invalidate before any write: failure leaves no hit on a
+                // partially overwritten entry. Recheck the returned native
+                // resource against the live registered shadow.
+                cache.entries[entry] = None;
+                for (k, binding) in bindings.iter().enumerate() {
+                    let Some(b) = binding else { continue; };
+                    let kept = make_twinned(&b.view, cache.slot(entry, k as u32, false),
+                        Some(cache.slot(entry, k as u32, true)))??;
+                    if kept.as_raw() != b.shadow.buffer.as_raw() {
+                        return None;
+                    }
+                }
+                cache.entries[entry] = Some(TableTemplate { keys, runs });
+            }
+            let template = cache.entries[entry].as_ref()?;
+            let host = host()?;
+            let mut copied = 0u64;
+            for &(from, count) in &template.runs {
+                let to = first + from;
+                let twin_count = count.min((self.twins.len() as u32).saturating_sub(to));
+                // SAFETY: source is CPU-only, destination is this
+                // recording's newly allocated, exclusive dynamic range.
+                unsafe {
+                    host.device.CopyDescriptorsSimple(count, self.cpu(to),
+                        cache.slot(entry, from, false), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    if twin_count != 0 {
+                        host.device.CopyDescriptorsSimple(twin_count, self.cpu(self.raw + to),
+                            cache.slot(entry, from, true), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    }
+                }
+                copied += u64::from(count);
+                for k in from..from + count {
+                    let index = first + k;
+                    let b = bindings[k as usize].as_mut().expect("template run");
+                    if let Some(twin) = self.twins.get(index as usize) {
+                        twin.store(true, Relaxed);
+                    }
+                    self.write_stride(index, view_stride_word(&b.view));
+                    self.keep_ref(index, Some(&b.shadow.buffer));
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let stamp = crate::host::coarse_ms() as u32;
+                        if let Some(written) = self.written.get(index as usize) { written.store(stamp, Relaxed); }
+                        if let Some(written) = self.written.get((self.raw + index) as usize).filter(|_| twin_count != 0 && k - from < twin_count) {
+                            written.store(stamp, Relaxed);
+                        }
+                    }
+                    b.ready = cache.ready.get(&b.key).copied();
+                }
+            }
+            TEMPLATE_STATS[if hit { 0 } else { 1 }].fetch_add(1, Relaxed);
+            TEMPLATE_STATS[2].fetch_add(copied, Relaxed);
+            TEMPLATE_STATS[3].fetch_add(template.runs.len() as u64, Relaxed);
+            Some(bindings)
         })
     }
 
@@ -6089,6 +6192,132 @@ pub(crate) struct Listed {
     pub(crate) ready: (u64, usize, bool),
     /// The title's slot last noted for it, and whether the draw read it.
     pub(crate) tabled: Option<(u32, bool)>,
+}
+
+/// CPU-only descriptor templates. Dynamic destination ranges still belong
+/// to the recording, and CBVs are never shared. The template owns no GPU
+/// resource: a fresh live Shadow is required before every reuse.
+type TemplateKey = ([u32; 3], u64);
+
+pub(crate) struct TemplateBinding {
+    pub(crate) view: View,
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    key: TemplateKey,
+    pub(crate) ready: Option<(u64, usize, bool)>,
+}
+
+impl TemplateBinding {
+    pub(crate) fn note_ready(&self, recording: u64, ready: (u64, usize, bool)) {
+        TABLE_TEMPLATES.with(|cache| {
+            if let Some(cache) = cache.borrow_mut().as_mut()
+                && cache.recording == recording
+                && (cache.ready.len() < 4096 || cache.ready.contains_key(&self.key))
+            {
+                cache.ready.insert(self.key, ready);
+            }
+        });
+    }
+}
+
+/// Only already allocated, registered buffers with ordinary aligned views.
+/// Loose windows, textures (including changing mip residency), constants
+/// and views requiring a separate exact shadow all keep the existing path.
+fn template_binding(handle: u64) -> Option<TemplateBinding> {
+    let words = super::record_at(handle)?;
+    let view = super::view_at(words[1], words[2])?;
+    let kind = view_elements(&view)?;
+    let (base, width) = buffer_extent(&view)?;
+    let (start, len) = buffer_range(&view)?;
+    if width == 0 || len == 0 || start < base || start.checked_add(len)? > base.checked_add(width)? {
+        return None;
+    }
+    let shadow = crate::shadow::template_registered(base, width)?;
+    if shadow.in_place() || shadow.offset_in(base).is_none() || shadow.offset_in(start).is_none() {
+        return None;
+    }
+    let element = crate::resource::element(kind.2).map_or(0, |(bytes, _)| bytes);
+    if off_elements(shadow.offset(start), kind.0, kind.1, element) {
+        return None;
+    }
+    let key = (words, shadow.id());
+    Some(TemplateBinding { view, shadow, key, ready: None })
+}
+
+const TEMPLATE_WIDTH: u32 = 64;
+const TEMPLATE_COUNT: usize = 128;
+
+fn template_runs(keys: &[Option<TemplateKey>]) -> Vec<(u32, u32)> {
+    let mut runs = Vec::new();
+    let mut k = 0;
+    while k < keys.len() {
+        let start = k;
+        while k < keys.len() && keys[k].is_some() { k += 1; }
+        if k - start >= 4 {
+            runs.push((start as u32, (k - start) as u32));
+        }
+        if k < keys.len() { k += 1; }
+    }
+    runs
+}
+
+struct TableTemplate {
+    keys: Vec<Option<TemplateKey>>,
+    runs: Vec<(u32, u32)>,
+}
+
+struct TableTemplates {
+    heap: ID3D12DescriptorHeap,
+    step: usize,
+    start: usize,
+    entries: Vec<Option<TableTemplate>>,
+    recording: u64,
+    ready: std::collections::HashMap<TemplateKey, (u64, usize, bool)>,
+}
+
+impl TableTemplates {
+    fn new() -> Option<Self> {
+        let host = host()?;
+        // SAFETY: a non-shader-visible heap; only the owning CPU thread
+        // ever reads or writes its descriptors.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: TEMPLATE_COUNT as u32 * TEMPLATE_WIDTH * 2,
+                ..Default::default()
+            }).ok()?;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            Some(Self { heap, step, start, entries: (0..TEMPLATE_COUNT).map(|_| None).collect(),
+                recording: 0, ready: Default::default() })
+        }
+    }
+
+    fn slot(&self, entry: usize, k: u32, twin: bool) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(!windows::core::Interface::as_raw(&self.heap).is_null());
+        let index = entry * (TEMPLATE_WIDTH as usize * 2) + k as usize
+            + if twin { TEMPLATE_WIDTH as usize } else { 0 };
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + index * self.step }
+    }
+}
+
+thread_local! {
+    static TABLE_TEMPLATES: std::cell::RefCell<Option<TableTemplates>> = const { std::cell::RefCell::new(None) };
+}
+
+static TEMPLATE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn persistent_tables() -> bool {
+    crate::toggled!("VICTORY_PERSISTENT_TABLES")
+}
+
+#[cfg(test)]
+#[test]
+fn template_runs_leave_variable_slots_out() {
+    let a = Some(([1, 2, 3], 8));
+    let b = Some(([1, 2, 3], 9));
+    let keys = [None, a, a, a, b, None, a, a, None, b, b, b, b, b];
+    assert_eq!(template_runs(&keys), vec![(1, 4), (9, 5)]);
+    assert_ne!(a, b); // a newly allocated shadow cannot hit an old template
 }
 
 struct ListView {
