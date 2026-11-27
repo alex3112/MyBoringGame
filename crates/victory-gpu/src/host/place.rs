@@ -37,6 +37,7 @@
 
 use super::*;
 use crate::shadow::Shadow;
+use std::sync::atomic::AtomicU64;
 
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
