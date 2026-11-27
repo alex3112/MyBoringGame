@@ -2562,6 +2562,50 @@ fn wide_merge() -> bool {
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
+// Share compare results for exact declared ranges whose 64 KiB hash
+// blocks overlap or touch. The ranges used for CPU landing stay exact;
+// only the GPU hash dispatch and result slots are shared.
+fn compare_join() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPARE_JOIN").is_none_or(|v| v != "0"))
+}
+
+// Declared spans arrive sorted by address for one shadow. Return the result
+// slot of each original span, and the full dispatch span for its leader.
+// If the result arena cannot hold the entire layout, keep the old fallback.
+fn compare_layout(
+    spans: &[crate::shadow::CardSpan],
+    at: u32,
+    capacity: u64,
+) -> Option<(Vec<(u32, Option<crate::shadow::CardSpan>)>, u32)> {
+    let runs = crate::shadow::joined_piece_runs(spans.to_vec());
+    let mut bases = Vec::with_capacity(runs.len());
+    let mut end = at;
+    for run in &runs {
+        bases.push(end);
+        end = end.checked_add(run.pieces)?;
+    }
+    if u64::from(end) * 4 > capacity { return None; }
+    let mut layout = Vec::with_capacity(spans.len());
+    let mut i = 0;
+    for span in spans {
+        let before = i;
+        while runs.get(i).is_some_and(|run| span.first >= run.first + run.pieces) {
+            i += 1;
+        }
+        let run = *runs.get(i)?;
+        if span.first < run.first || span.first + span.pieces > run.first + run.pieces {
+            return None;
+        }
+        let leader = layout.is_empty() || i != before;
+        layout.push((bases[i] + span.first - run.first, leader.then_some(run)));
+    }
+    Some((layout, end))
+}
+
+static COMPARE_JOIN_STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 struct CardRange {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     /// As declared (title addresses), for the statistics.
@@ -2569,6 +2613,8 @@ struct CardRange {
     span: crate::shadow::CardSpan,
     /// Its first piece's dword in the compare's results.
     at: u32,
+    /// Only the leader of a shared compare run records a dispatch.
+    compare_run: Option<crate::shadow::CardSpan>,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
     /// Looked at by `crate::picked`, and not declared: what is found changed
@@ -3068,16 +3114,31 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
-    let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
-    pieces.sort_unstable();
-    pieces.dedup();
-    pieces
+fn flagged_pieces(flags: impl Iterator<Item = (usize, u32, bool)>) -> std::collections::HashSet<(usize, u32)> {
+    flags.filter(|f| f.2).map(|f| (f.0, f.1)).collect()
 }
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{compare_layout, flagged_pieces, landable};
+
+    #[test]
+    fn compare_layout_keeps_exact_ranges_and_shares_slots() {
+        use crate::shadow::CardSpan;
+        let span = |from, to, first, pieces| CardSpan { from, to, first, pieces, skew: 0 };
+        let exact = [span(4, 8, 0, 1), span(16, 20, 0, 1),
+                     span(65536, 65540, 1, 1), span(262144, 262148, 4, 1)];
+        let (layout, end) = compare_layout(&exact, 7, 40).unwrap();
+        assert_eq!(end, 10);
+        assert_eq!(layout.iter().map(|x| x.0).collect::<Vec<_>>(), vec![7, 7, 8, 9]);
+        assert_eq!(layout[0].1.unwrap().pieces, 2);
+        assert!(layout[1].1.is_none());
+        assert!(layout[2].1.is_none());
+        assert_eq!(layout[3].1.unwrap().first, 4);
+        assert!(compare_layout(&exact, 7, 39).is_none());
+        assert_eq!(exact[1].from, 16);
+        assert_eq!(exact[1].to, 20);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3107,7 +3168,7 @@ mod relay_tests {
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
         let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
-        let fetch = flagged_pieces(&flags);
+        let fetch = flagged_pieces(flags.into_iter());
         assert!(fetch.contains(&(a, 3)));
         assert!(!fetch.contains(&(a, 4)));
         assert!(!fetch.contains(&(b, 3)));
@@ -3908,7 +3969,15 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 /// Readback storage is reserved early and reused after each fetch fence.
 /// Large landings are split, not backed by a second, larger allocation.
-const RELAY_FETCH_BYTES: u64 = 16 << 20;
+// Larger bounded batches reduce CPU/GPU fence round trips. Explicit
+// overrides are clamped; failure still falls back to the original sizes.
+fn relay_fetch_bytes() -> u64 {
+    static BYTES: OnceLock<u64> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_RELAY_FETCH_MB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(32).clamp(1, 64) << 20
+    })
+}
 pub(crate) static ZERO_REUSE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 pub(crate) static MEMORY_REUSE: [std::sync::atomic::AtomicU64; 6] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 6];
@@ -4190,6 +4259,9 @@ fn late_line(frames: f64) {
         release_line(frames);
         let counts = FETCH_COPY_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!("relay fetch copies per frame (VICTORY_RELAY_JOIN_FETCH={}): {:.0} ranges, {:.0} copy commands", u8::from(join_relay_fetch()), counts[0], counts[1]);
+        let [blocks, passes] = COMPARE_JOIN_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!("memory compare join per frame (VICTORY_COMPARE_JOIN={}): {:.0} redundant 64 KiB hashes avoided, {:.0} compare passes avoided",
+            u8::from(compare_join()), blocks, passes);
     }
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -4965,21 +5037,36 @@ impl Host {
                 }
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                plan.ranges.push(CardRange {
-                    shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
-                    at,
-                    compared,
-                    picked: false,
-                });
-                if compared {
-                    at += span.pieces;
+            let spans: Vec<_> = spans.into_iter().filter_map(|(from, to)| {
+                shadow.card_span(from, to).map(|span| ((from, to), span))
+            }).collect();
+            // The synchronous path consumes each flag independently; keep
+            // that path unchanged. Relay landing already uses shared flags
+            // across all declared subranges of the same block.
+            let layout = if twin && flown && relay() && compare_join() && spans.len() > 1 {
+                let exact: Vec<_> = spans.iter().map(|(_, span)| *span).collect();
+                compare_layout(&exact, at, work.differs.2)
+            } else { None };
+            if let Some((layout, end)) = layout {
+                let old_pieces = spans.iter().map(|(_, span)| u64::from(span.pieces)).sum::<u64>();
+                let dispatches = layout.iter().filter(|(_, run)| run.is_some()).count();
+                COMPARE_JOIN_STATS[0].fetch_add(old_pieces.saturating_sub(u64::from(end - at)), Ordering::Relaxed);
+                COMPARE_JOIN_STATS[1].fetch_add((spans.len() - dispatches) as u64, Ordering::Relaxed);
+                for ((declared, span), (slot, compare_run)) in spans.into_iter().zip(layout) {
+                    plan.ranges.push(CardRange {
+                        shadow: shadow.clone(), declared, span, at: slot,
+                        compare_run, compared: true, picked: false,
+                    });
+                }
+                at = end;
+            } else {
+                for (declared, span) in spans {
+                    let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                    plan.ranges.push(CardRange {
+                        shadow: shadow.clone(), declared, span, at,
+                        compare_run: compared.then_some(span), compared, picked: false,
+                    });
+                    if compared { at += span.pieces; }
                 }
             }
         }
@@ -4994,6 +5081,7 @@ impl Host {
                     declared: (*from, from + len),
                     span,
                     at,
+                    compare_run: Some(span),
                     compared: true,
                     picked: true,
                 });
@@ -5026,7 +5114,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in plan.ranges.iter().filter(|r| r.compare_run.is_some()) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -5034,7 +5122,7 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
+                        card_pass(list, &r.compare_run.expect("compare leader"), size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -5117,13 +5205,19 @@ impl Host {
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
-            let buffer = [RELAY_FETCH_BYTES, 4 << 20, 1 << 20].into_iter().find_map(|size| {
+            let requested = relay_fetch_bytes();
+            let sizes = [requested, requested.min(16 << 20), requested.min(4 << 20), 1 << 20];
+            let buffer = sizes.iter().copied().enumerate()
+                .filter(|(i, size)| !sizes[..*i].contains(size))
+                .find_map(|(_, size)| {
                 self.shared_buffer(size).map(|(buffer, data)| {
                     name(&buffer, || "reusable relay readback".into());
                     MEMORY_REUSE[0].store(size, Ordering::Relaxed);
                     (buffer, data as usize, size)
                 })
             });
+            tracing::info!("relay fetch: requested {} MiB, allocated {} MiB, dedicated copy queue {}",
+                requested >> 20, buffer.as_ref().map_or(0, |b| b.2 >> 20), queue.is_some());
             Some(RelayFetch {
                 list,
                 queue,
@@ -5171,7 +5265,7 @@ impl Host {
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags = plan
                     .ranges
                     .iter()
                     .filter(|r| !r.picked)
@@ -5181,16 +5275,15 @@ impl Host {
                             let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
                         })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                    });
+                let fetched = flagged_pieces(flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
+                        if !fetched.contains(&(copy, r.span.first + p)) {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
@@ -5275,14 +5368,18 @@ impl Host {
         while first < pieces.len() {
             let mut last = first;
             let mut charged = 0;
-            // Each piece lies in a single 64 KiB title block. If checking
-            // hashes, charge the whole native hash span, including alignment,
-            // even where several partial pieces share one fetch.
+            let mut charged_blocks = std::collections::HashSet::new();
+            // Check::new fetches one whole hash block per (shadow, block).
+            // Charge exactly that layout, not every partial declaration,
+            // so overlapping declarations do not force additional batches.
             while last < pieces.len() {
                 let (shadow, lo, hi, _) = &pieces[last];
                 let bytes = if check_on {
-                    let (from, to) = shadow.card_hashed(shadow.card_piece_of(*lo));
-                    (to - from) as u64
+                    let block = shadow.card_piece_of(*lo);
+                    if charged_blocks.insert((shadow.id(), block)) {
+                        let (from, to) = shadow.card_hashed(block);
+                        (to - from) as u64
+                    } else { 0 }
                 } else {
                     (*hi - *lo) as u64
                 };
@@ -5449,10 +5546,15 @@ impl Host {
                 if let Some(check) = &check {
                     check.accumulate(&mut checked);
                 }
-                f.had.fetched(
-                    ahead,
-                    pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
-                );
+                // The dedicated copy queue has no proof of ordering
+                // behind later flights (ahead == 0). Such entries can
+                // never satisfy Had::holds for a submitted fence.
+                if ahead != 0 {
+                    f.had.fetched(
+                        ahead,
+                        pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
+                    );
+                }
             }
             // Keep the send history until every batch has been merged.
             after_all = after_all.min(after);
