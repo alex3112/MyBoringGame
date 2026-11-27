@@ -206,6 +206,8 @@ pub(crate) struct Recording {
     inner: Mutex<Inner>,
     /// Translated to its end.
     done: AtomicBool,
+    /// Published before done. Never access a detached backend to test readiness.
+    pending: OnceLock<Option<Arc<crate::host::aside::Coming>>>,
     moved: Condvar,
     abandoned: AtomicBool,
 }
@@ -231,6 +233,7 @@ impl Recording {
             kind,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
+            pending: OnceLock::new(),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
         }
@@ -242,12 +245,22 @@ impl Recording {
         self.done.load(Acquire)
     }
 
-    /// Waits until it is translated.
+    /// A native close may finish before the CPU heap inspection. Do not
+    /// occupy a translator or the submitting worker while that job runs.
+    pub(crate) fn ready(&self) -> bool {
+        self.done() && self.pending.get().and_then(Option::as_ref).is_none_or(|p| p.ready())
+    }
+
+    /// Waits until it is translated and its heap inspection has completed.
     pub(crate) fn wait(&self) {
         let _wait = crate::timeline::span_id("waiting for recording translation", self.id, 0);
         let mut inner = held(&self.inner);
         while !self.done() {
             inner = self.moved.wait(inner).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(inner);
+        if let Some(pending) = self.pending.get().and_then(Option::as_ref) {
+            pending.wait_ready();
         }
     }
 
@@ -282,6 +295,9 @@ impl Recording {
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
+                // The backend is still owned by this recording until done
+                // is published. Only the immutable completion token escapes.
+                let _ = self.pending.set(super::host_list(back).and_then(|host| host.pending_coming()));
                 crate::timeline::mark("recording translated", self.id, 0);
                 self.done.store(true, Release);
                 self.moved.notify_all();
@@ -310,6 +326,11 @@ impl Drop for Recording {
             // here was never submitted. Do not retain native objects, upload
             // memory or descriptor state on the lightweight backend.
             let mut back = unsafe { Box::from_raw(inner.back as *mut List) };
+            // An unsubmitted recording still owns its native list. Do not
+            // discard its pending heap work or retained objects prematurely.
+            if let Some(host) = back.host.as_ref() {
+                host.finish_coming();
+            }
             back.host = None;
             back.earlier.clear();
             back.gate.clear();
@@ -341,7 +362,9 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    // Leave scheduling capacity for title jobs, heap workers and submit.
+    let default = std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 8));
+    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");

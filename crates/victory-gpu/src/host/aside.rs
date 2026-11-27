@@ -16,12 +16,26 @@ use super::*;
 pub(crate) type Refresh = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
 
 /// What is being found, until it is.
-pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar);
+pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar, std::sync::atomic::AtomicBool);
 
 /// Since the last frame line: microseconds lists waited at their close.
 pub(crate) static WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Coming {
+    /// Completion is monotonic, even after the result was consumed.
+    pub(crate) fn ready(&self) -> bool {
+        self.2.load(Ordering::Acquire)
+    }
+
+    /// Does not consume the result (only the submission owns that operation).
+    pub(crate) fn wait_ready(&self) {
+        if self.ready() { return; }
+        let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !self.ready() {
+            found = self.1.wait(found).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     /// What was found.
     pub(crate) fn wait(&self) -> Vec<Refresh> {
         let began = std::time::Instant::now();
@@ -37,7 +51,11 @@ impl Coming {
     }
 
     fn found(&self, what: Vec<Refresh>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(what);
+        {
+            let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            *found = Some(what);
+            self.2.store(true, Ordering::Release);
+        }
         self.1.notify_all();
     }
 }
@@ -53,7 +71,7 @@ type Job = Box<dyn FnOnce() + Send>;
 /// there is no such thread.
 pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std::sync::Arc<Coming> {
     static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
-    let coming = std::sync::Arc::new(Coming(Mutex::new(None), std::sync::Condvar::new()));
+    let coming = std::sync::Arc::new(Coming(Mutex::new(None), std::sync::Condvar::new(), std::sync::atomic::AtomicBool::new(false)));
     let told = coming.clone();
     let job: Job = Box::new(move || {
         // (However it ends, the list that waits goes on.)
@@ -67,7 +85,12 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
             .name("victory-aside".into())
             .spawn(move || {
                 crate::cores::keep_on_fast_cores("victory-aside");
-                jobs.into_iter().for_each(|job| job())
+                // This worker is itself a dependency of the submission lane.
+                crate::queue::no_drain_here();
+                jobs.into_iter().for_each(|job| {
+                    job();
+                    crate::queue::line_moved();
+                })
             })
             .ok()
             .map(|_| Mutex::new(send))
@@ -96,7 +119,11 @@ mod tests {
         });
         assert!(coming.0.lock().unwrap().is_none());
         go.send(()).unwrap();
+        coming.wait_ready();
+        assert!(coming.ready());
         assert!(coming.wait().is_empty());
+        assert!(coming.ready(), "consuming the result does not revoke readiness");
+        coming.wait_ready();
         assert!(begin(|| panic!("a panic of the work")).wait().is_empty());
         assert!(begin(Vec::new).wait().is_empty());
     }

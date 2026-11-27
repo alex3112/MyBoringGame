@@ -566,7 +566,13 @@ impl<T> SharedRetire<T> {
     }
 }
 
-static SHARED_RETIRED: OnceLock<Mutex<SharedRetire<SlotResource>>> = OnceLock::new();
+const RETIRE_SHARDS: usize = 32;
+static SHARED_RETIRED: OnceLock<[Mutex<SharedRetire<SlotResource>>; RETIRE_SHARDS]> = OnceLock::new();
+
+fn retirement_shard<T>(owner: &std::sync::Arc<T>) -> usize {
+    let key = std::sync::Arc::as_ptr(owner) as usize;
+    ((key >> 4) ^ (key >> 11)) & (RETIRE_SHARDS - 1)
+}
 static SHARED_RETIRE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 fn coalesce_retirements() -> bool {
@@ -606,7 +612,8 @@ pub(crate) fn retire_slot_resource(object: std::sync::Arc<SlotResource>) {
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
     if coalesce_retirements() {
-        let mut pending = SHARED_RETIRED.get_or_init(|| Mutex::new(SharedRetire::new()))
+        let shard = retirement_shard(&object);
+        let mut pending = SHARED_RETIRED.get_or_init(|| std::array::from_fn(|_| Mutex::new(SharedRetire::new())))[shard]
             .lock().unwrap_or_else(|e| e.into_inner());
         let reused = pending.add(started, object);
         SHARED_RETIRE_STATS[usize::from(reused)].fetch_add(1, Ordering::Relaxed);
@@ -638,10 +645,12 @@ fn take_retired(finished: u64) -> Vec<(u64, Retired)> {
     let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
     let mut done: Vec<_> = retired.drain(..n).collect();
     drop(retired);
-    if let Some(pending) = SHARED_RETIRED.get() {
-        let owners = pending.lock().unwrap_or_else(|e| e.into_inner()).take(finished);
-        SHARED_RETIRE_STATS[2].fetch_add(owners.len() as u64, Ordering::Relaxed);
-        done.extend(owners.into_iter().map(|(fence, owner)| (fence, Retired::SharedResource(owner))));
+    if let Some(shards) = SHARED_RETIRED.get() {
+        for pending in shards {
+            let owners = pending.lock().unwrap_or_else(|e| e.into_inner()).take(finished);
+            SHARED_RETIRE_STATS[2].fetch_add(owners.len() as u64, Ordering::Relaxed);
+            done.extend(owners.into_iter().map(|(fence, owner)| (fence, Retired::SharedResource(owner))));
+        }
     }
     done
 }
@@ -5887,6 +5896,11 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         }
+        // No queue mutex is held here. Readiness was checked by the lane;
+        // finish the CPU steps before cut_for examines their order.
+        for list in &lists {
+            list.host().finish_coming();
+        }
         late_threads();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -6206,6 +6220,11 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // Covers the synchronous/internal entry points too. The asynchronous
+        // lane normally already materialized the pending steps in execute_parts.
+        for list in runs {
+            list.finish_coming();
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -7008,6 +7027,18 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.close_inner(false);
+    }
+
+    /// Only the final THIN close may leave the CPU-only refresh work
+    /// outstanding. The queue checks its readiness before unfolding.
+    pub(crate) fn close_thin(&self) {
+        static DEFER: OnceLock<bool> = OnceLock::new();
+        let defer = *DEFER.get_or_init(|| std::env::var_os("VICTORY_HEAP_CLOSE_DEFER").is_none_or(|v| v != "0"));
+        self.close_inner(defer);
+    }
+
+    fn close_inner(&self, defer: bool) {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
@@ -7017,8 +7048,10 @@ impl HostList {
         }
         self.batches_common();
         self.card_budget_out();
-        self.take_coming();
-        self.deferred().build_submission_index();
+        if !defer || self.pending_coming().is_none() {
+            self.take_coming();
+            self.deferred().build_submission_index();
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7045,10 +7078,22 @@ impl HostList {
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
     }
 
+    pub(crate) fn pending_coming(&self) -> Option<std::sync::Arc<aside::Coming>> {
+        self.coming.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, coming)| coming.clone())
+    }
+
+    /// At the submission boundary, before any CPU hazard analysis or step
+    /// indexing. Same insertion point, same refreshes as the old close.
+    pub(crate) fn finish_coming(&self) {
+        if self.take_coming() {
+            self.deferred().build_submission_index();
+        }
+    }
+
     /// The refreshes that were still to come are put among the steps.
-    fn take_coming(&self) {
+    fn take_coming(&self) -> bool {
         let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-            return;
+            return false;
         };
         let found = coming.wait();
         let mut deferred = self.deferred();
@@ -7057,6 +7102,7 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+        true
     }
 
     /// Only after the list's last submission finished (every one is waited

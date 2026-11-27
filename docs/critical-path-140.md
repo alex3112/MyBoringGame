@@ -1,0 +1,11 @@
+# 0.140 — remove recording-worker heap rendezvous
+
+0.139 capture: 6 title frames in 488.1 ms, direct-queue stamp coverage 94/94; 47.68 ms per frame between stamps before the next CPU submit call; 29.38 ms/frame aggregated list close waits for heap views; 20.76 ms/frame wait for heap records before submission. These overlap and are not additive or direct predictions of a gain.
+
+Changes:
+- Final THIN native Close no longer waits for the outstanding heap buffer inspection. Translation publishes its completion token; the queue considers a recording ready only after both translation and inspection finish. Heap worker signals the lane. This frees a translation worker for other lists, while maintaining per-queue order and native descriptor readiness. The CPU refresh steps are spliced at their original position before cut_for, hazard analysis, card_steps, or submission indexing, outside the lane lock. Cut/intermediate close and non-THIN close retain the old behavior. Explicit drains still wait for both; an abandoned list finishes its pending work before release. Multiple pending passes within one list still use the original rendezvous. VICTORY_HEAP_CLOSE_DEFER=0 restores old close.
+- Shard shared descriptor resource retirement into 32 locks by owner identity. Identical owners always use the same shard and keep the latest original retirement deadline; fence lag unchanged.
+- Disable speculative early heap-sync rounds by default on up to 16 logical CPUs, retaining the mandatory per-submission sync and the VICTORY_HEAP_SYNC_EARLY override. Default worker counts adapt to reported logical CPUs (THIN half, views/records/under roughly a third, capped at previous defaults). Overrides remain.
+- Revert the ineffective 0.136 incremental heap index default to the previous non-incremental sweep. VICTORY_HEAP_INCREMENTAL=1 opt-in; periodic validity and every-frame unwatched refresh preserved.
+
+No deliberate shader, presentation, queue fence, or memory admission changes. This does not resolve every dependency or establish a hard-fault cause. No Windows compilation/runtime verification in this environment. No separate A/B launch required: normal diagnostic release and existing CMD, without active timeline capture, are sufficient to measure FPS. 

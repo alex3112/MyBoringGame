@@ -333,7 +333,8 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let default = std::thread::available_parallelism().map_or(3, |n| n.get().div_ceil(3).clamp(2, 6));
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
@@ -348,7 +349,9 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let cap = if records { 6usize } else { 4 };
+            let default = std::thread::available_parallelism().map_or(3, |n| n.get().div_ceil(3).clamp(2, cap));
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);

@@ -184,7 +184,7 @@ fn sync_aside() -> bool {
 }
 
 /// How long that thread waits for a submission before it makes a round of its
-/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 4 if not given; `0`: none). The title
+/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 0 on up to 16 logical CPUs, otherwise 4). The title
 /// copies its records while it records, and the first submission of a frame
 /// found all of them: 8 ms waited for (run cpu-2). A round made meanwhile
 /// leaves it those written since.
@@ -192,7 +192,10 @@ fn sync_aside() -> bool {
 fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        // Speculative full rounds competed with the heap pass and the
+        // translators. Required per-submission synchronization stays on.
+        let default = if std::thread::available_parallelism().is_ok_and(|n| n.get() > 16) { 4 } else { 0 };
+        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }

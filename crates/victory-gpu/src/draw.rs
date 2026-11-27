@@ -719,7 +719,7 @@ impl SpanIndex {
 
 fn heap_incremental() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_INCREMENTAL").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_INCREMENTAL").is_some_and(|v| v == "1"))
 }
 
 // Inspected slots, actual index changes, retained slots, copies, time

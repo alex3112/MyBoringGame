@@ -704,7 +704,13 @@ extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
-        host.close();
+        // SAFETY: host_list just established that this is a live list;
+        // only its translating worker may close the final THIN part.
+        if unsafe { (*this.cast::<List>()).lazy_host } {
+            host.close_thin();
+        } else {
+            host.close();
+        }
     }
     S_OK
 }
