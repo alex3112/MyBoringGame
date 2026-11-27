@@ -9628,6 +9628,7 @@ impl Meter {
             }
         }
         // Passes over the heap's buffer views for shaders that pick them by index.
+        crate::draw::heap_index_log(frames);
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
