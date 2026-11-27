@@ -526,10 +526,10 @@ fn system_memory() -> (u64, u64) {
 
 /// Whether the address space is walked for the memory map line
 /// ([`log_memory_map`]). On by default (this module is in diagnostics
-/// builds only); `VICTORY_MEMORY_MAP=0` leaves the walk out.
+/// builds only); `VICTORY_MEMORY_MAP=1` enables the expensive walk.
 fn memory_map() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_MAP").is_some_and(|v| v == "1"))
 }
 
 /// Asks which of the pages in `asked` (address, answer) are in physical

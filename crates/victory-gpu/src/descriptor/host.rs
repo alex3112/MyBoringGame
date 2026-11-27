@@ -183,8 +183,8 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Dynamic slots alone can share COM ownership. Persistent bindless
-    /// slots retain the original independent references.
+    /// Shared COM ownership for dynamic and (optionally) persistent slots.
+    /// The same owner remains alive until the latest retiring fence.
     dynamic_kept: Box<[Mutex<Option<std::sync::Arc<crate::host::SlotResource>>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
@@ -1030,6 +1030,15 @@ fn indexed_wait_preserves_earliest_deadline_and_latest_recheck() {
     assert_eq!(waiting.take(21, true), vec![1]);
 }
 
+fn share_persistent_resources() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    share_dynamic_resources() && *ON.get_or_init(|| std::env::var_os("VICTORY_PERSISTENT_SHARED_REFS").is_none_or(|v| v != "0"))
+}
+
+static TABLE_RELEASE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+static PERSISTENT_REFS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 fn share_dynamic_resources() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_SHARED_REFS").is_none_or(|v| v != "0"))
@@ -1062,12 +1071,17 @@ fn intern_slot_resource(resource: &ID3D12Resource) -> std::sync::Arc<crate::host
 
 pub(super) fn lifetime_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    let table_release = TABLE_RELEASE.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("dynamic table slots returned per frame: {:.0} ranges under {:.0} heap locks", table_release[0], table_release[1]);
+    let persistent = PERSISTENT_REFS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("persistent descriptor owners per frame (VICTORY_PERSISTENT_SHARED_REFS={}): {:.0} unchanged slots, {:.0} shared owners retired",
+        u8::from(share_persistent_resources()), persistent[0], persistent[1]);
     tracing::info!("buffer-only descriptor fast path (VICTORY_HEAP_BUFFER_FAST={}): {:.0} updates per frame without texture locks",
         u8::from(fast_buffer_slots()), BUFFER_FAST.swap(0, Relaxed) as f64 / frames);
     let waits = WAIT_DETAIL.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     let refs = DYNAMIC_REF_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "descriptor lifetime per frame (VICTORY_HEAP_WAIT_INDEXED={}, VICTORY_DYNAMIC_SHARED_REFS={}): {:.0} newly pending, {:.0} coalesced, {:.0} retained rechecks; {:.0} shared owner hits, {:.0} new owners, {:.0} unchanged dynamic slots, {:.0} shared owners retired",
+        "descriptor lifetime per frame (VICTORY_HEAP_WAIT_INDEXED={}, VICTORY_DYNAMIC_SHARED_REFS={}): {:.0} newly pending, {:.0} coalesced, {:.0} retained rechecks; {:.0} shared owner hits (all shared slots), {:.0} new owners, {:.0} unchanged dynamic slots, {:.0} dynamic owners retired",
         u8::from(indexed_copied_wait()), u8::from(share_dynamic_resources()),
         waits[0], waits[1], waits[2], refs[0], refs[1], refs[2], refs[3]
     );
@@ -1808,8 +1822,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             texture_history: Slots::new(count as usize),
             away: Mutex::default(),
-            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            dynamic_kept: (0..if share_dynamic_resources() { extra } else { 0 }).map(|_| Mutex::new(None)).collect(),
+            kept: (0..if !sampler && share_persistent_resources() { 0 } else { count + extra }).map(|_| Mutex::new(None)).collect(),
+            dynamic_kept: (0..if !sampler && share_persistent_resources() { count + extra }
+                else if share_dynamic_resources() { extra } else { 0 }).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2997,17 +3012,28 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
+        self.release_many(std::iter::once((first, n)));
+    }
+
+    pub(crate) fn release_many(&self, ranges: impl IntoIterator<Item = (u32, u32)>) {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+        let (mut given, mut spans) = (0u32, 0u64);
+        for (first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else { continue; };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                given += slots.iter().filter(|taken| **taken).count() as u32;
+                slots.fill(false);
+                spans += 1;
+            }
         }
+        if spans != 0 {
+            self.free.fetch_add(given, Relaxed);
+            self.too_long.store(u32::MAX, Relaxed);
+        }
+        TABLE_RELEASE[0].fetch_add(spans, Relaxed);
+        TABLE_RELEASE[1].fetch_add(1, Relaxed);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3070,7 +3096,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3127,23 +3153,34 @@ impl HostHeap {
         }
     }
 
-    /// Keep a dynamic slot's owner until precisely the same retirement
-    /// point as the old per-slot COM reference.
+    fn shared_slot(&self, index: u32) -> Option<&Mutex<Option<std::sync::Arc<crate::host::SlotResource>>>> {
+        let at = if !self.sampler && share_persistent_resources() {
+            index
+        } else {
+            index.checked_sub(self.count)?
+        };
+        self.dynamic_kept.get(at as usize)
+    }
+
+    /// Keep the slot's owner until precisely the same retirement point as
+    /// the old per-slot COM reference.
     fn keep_dynamic(&self, index: u32, resource: Option<&ID3D12Resource>) -> bool {
         use windows::core::Interface;
-        let Some(slot) = index.checked_sub(self.count).and_then(|at| self.dynamic_kept.get(at as usize)) else {
+        let Some(slot) = self.shared_slot(index) else {
             return false;
         };
         let old = {
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if slot.as_ref().map(|r| r.0.as_raw()) == resource.map(Interface::as_raw) {
-                DYNAMIC_REF_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let stats = if index < self.count { &PERSISTENT_REFS[0] } else { &DYNAMIC_REF_STATS[2] };
+                stats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return true;
             }
             std::mem::replace(&mut *slot, resource.map(intern_slot_resource))
         };
         if let Some(old) = old {
-            DYNAMIC_REF_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stats = if index < self.count { &PERSISTENT_REFS[1] } else { &DYNAMIC_REF_STATS[3] };
+            stats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::host::retire_slot_resource(old);
         }
         true
@@ -3181,7 +3218,7 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        if let Some(slot) = index.checked_sub(self.count).and_then(|at| self.dynamic_kept.get(at as usize)) {
+        if let Some(slot) = self.shared_slot(index) {
             return slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.0.clone());
         }
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()

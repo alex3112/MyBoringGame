@@ -175,6 +175,23 @@ pub(super) fn idle_backs() -> Option<u64> {
 /// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static OP_SAMPLE: AtomicU64 = AtomicU64::new(0);
+const OP_COUNT: usize = COPY_TEXTURE as usize + 1;
+static OP_TIME: [AtomicU64; OP_COUNT] = [const { AtomicU64::new(0) }; OP_COUNT];
+static OP_SAMPLES: [AtomicU64; OP_COUNT] = [const { AtomicU64::new(0) }; OP_COUNT];
+
+fn op_profile() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_OP_PROFILE").is_none_or(|v| v != "0"))
+}
+
+struct OpSample(usize, std::time::Instant);
+impl Drop for OpSample {
+    fn drop(&mut self) {
+        OP_TIME[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Relaxed);
+        OP_SAMPLES[self.0].fetch_add(1, Relaxed);
+    }
+}
 
 fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -370,6 +387,14 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    if op_profile() {
+        let mut rows: Vec<_> = (0..OP_COUNT).map(|i| (i, OP_SAMPLES[i].swap(0, Relaxed), OP_TIME[i].swap(0, Relaxed))).filter(|r| r.1 != 0).collect();
+        rows.sort_unstable_by_key(|r| std::cmp::Reverse(r.2));
+        for (i, n, ns) in rows.into_iter().take(10) {
+            tracing::info!(op = op_name(i as u64), samples = n, mean_us = ns as f64 / n as f64 / 1000.0,
+                estimated_ms_per_frame = ns as f64 * 32.0 / frames / 1e6, "translation sampled");
+        }
+    }
 }
 
 #[inline]
@@ -415,6 +440,13 @@ macro_rules! plain {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
         /// Whether `op` was one of them; done on `list`.
+        #[inline]
+        fn plain_name(op: u64) -> &'static str {
+            match op {
+                $(n if n == Plain::$op as u64 => stringify!($op),)*
+                _ => "other",
+            }
+        }
         #[inline]
         fn run_plain(op: u64, list: This, w: &[u64]) -> bool {
             match op {
@@ -482,6 +514,19 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+
+fn op_name(op: u64) -> &'static str {
+    match op {
+        RESET => "RESET", CLOSE => "CLOSE", UPLOAD => "UPLOAD",
+        BARRIER => "BARRIER", BARRIER_GROUPS => "BARRIER_GROUPS",
+        VIEWPORTS => "VIEWPORTS", SCISSORS => "SCISSORS", BLEND_FACTOR => "BLEND_FACTOR",
+        HEAPS => "HEAPS", COMPUTE_CONSTANTS => "COMPUTE_CONSTANTS",
+        GRAPHICS_CONSTANTS => "GRAPHICS_CONSTANTS", INDEX_BUFFER => "INDEX_BUFFER",
+        VERTEX_BUFFERS => "VERTEX_BUFFERS", TARGETS => "TARGETS",
+        CLEAR_RTV => "CLEAR_RTV", CLEAR_DSV => "CLEAR_DSV", COPY_TEXTURE => "COPY_TEXTURE",
+        _ => plain_name(op),
+    }
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -696,6 +741,7 @@ extern "system" fn copy_texture_region_x(
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    let sample = op_profile() && OP_SAMPLE.fetch_add(1, Relaxed) % 32 == 0;
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -704,6 +750,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if calls % 64 == 0 {
             skip = left();
         }
+        let _sample = (sample && (op as usize) < OP_COUNT)
+            .then(|| OpSample(op as usize, std::time::Instant::now()));
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };

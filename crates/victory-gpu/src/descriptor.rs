@@ -685,6 +685,30 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Release exactly the recorded ranges at the same lifetime boundary as
+/// release_dynamic, but hold the heap registry and allocator lock once
+/// for each consecutive run of ranges belonging to a heap.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_many(ranges: &[(usize, u32, u32)]) {
+    static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*BATCH.get_or_init(|| std::env::var_os("VICTORY_TABLE_RELEASE_BATCH").is_none_or(|v| v != "0")) {
+        for &(heap, first, n) in ranges {
+            release_dynamic(heap, first, n);
+        }
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for run in ranges.chunk_by(|a, b| a.0 == b.0) {
+        let heap = run[0].0;
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: the registered heap is alive under the read guard.
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(run.iter().map(|&(_, first, n)| (first, n)));
+        }
+    }
+}
+
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]

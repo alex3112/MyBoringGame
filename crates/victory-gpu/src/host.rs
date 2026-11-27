@@ -83,7 +83,7 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// A retired object, dropped on whatever thread finishes the submission.
 #[allow(dead_code)]
 enum Retired {
-    Any(Box<dyn std::any::Any>),
+    Any(Box<dyn std::any::Any>, &'static str),
     /// What a descriptor slot showed: 20,000 a frame, without a box each.
     Resource(ID3D12Resource),
     SharedResource(std::sync::Arc<SlotResource>),
@@ -472,7 +472,11 @@ fn sweep() {
     crate::book::check();
     crate::residency::refresh();
     if crate::residency::pressured() {
-        trim_spare_chunks();
+        if !scratch_recycle() || crate::residency::critical_memory() {
+            trim_spare_chunks(0);
+        } else {
+            trim_spare_chunks(32 << 20);
+        }
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::tiles::sweep();
@@ -504,7 +508,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+        .push_back((started, Retired::Any(Box::new(object), std::any::type_name::<T>())));
 }
 
 /// [`retire`] for a resource.
@@ -671,6 +675,60 @@ fn release_batched() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_RELEASE_BATCHED").is_none_or(|v| v != "0"))
 }
 
+static DROP_KIND: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+static DROP_TYPES: OnceLock<Mutex<std::collections::HashMap<&'static str, (u64, u64)>>> = OnceLock::new();
+
+fn drop_detail() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_DETAIL").is_none_or(|v| v != "0"))
+}
+
+fn drop_retired_batch(batch: RetiredBatch) {
+    if !drop_detail() { drop(batch); return; }
+    let mut count = [0u64; 3];
+    let mut sampled = [0u64; 3];
+    let mut elapsed = [0u64; 3];
+    let mut types = std::collections::HashMap::<&'static str, (u64, u64)>::new();
+    // Offset samples across batches, without timing every COM Release.
+    static SAMPLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let offset = SAMPLE.fetch_add(1, Ordering::Relaxed) % 32;
+    for (_, object) in batch {
+        let (kind, name) = match &object {
+            Retired::Any(_, name) => (0, Some(*name)),
+            Retired::Resource(_) => (1, None),
+            Retired::SharedResource(_) => (2, None),
+        };
+        count[kind] += 1;
+        if count[kind] % 32 == offset {
+            let start = std::time::Instant::now();
+            drop(object);
+            let ns = start.elapsed().as_nanos() as u64;
+            sampled[kind] += 1;
+            elapsed[kind] += ns;
+            if let Some(name) = name {
+                let row = types.entry(name).or_default();
+                row.0 += 1;
+                row.1 += ns;
+            }
+        } else {
+            drop(object);
+        }
+    }
+    for i in 0..3 {
+        DROP_KIND[i].fetch_add(count[i], Ordering::Relaxed);
+        DROP_KIND[i + 3].fetch_add(sampled[i], Ordering::Relaxed);
+        DROP_KIND[i + 6].fetch_add(elapsed[i], Ordering::Relaxed);
+    }
+    if !types.is_empty() {
+        let mut total = DROP_TYPES.get_or_init(|| Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner());
+        for (name, (n, ns)) in types {
+            let row = total.entry(name).or_default();
+            row.0 += n;
+            row.1 += ns;
+        }
+    }
+}
+
 fn release_worker() -> Option<&'static std::sync::mpsc::SyncSender<RetiredBatch>> {
     static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<RetiredBatch>>> = OnceLock::new();
     WORKER.get_or_init(|| {
@@ -679,7 +737,7 @@ fn release_worker() -> Option<&'static std::sync::mpsc::SyncSender<RetiredBatch>
             while let Ok(batch) = receive.recv() {
                 let n = batch.len() as u64;
                 let start = std::time::Instant::now();
-                drop(batch);
+                drop_retired_batch(batch);
                 RELEASE_STATS[3].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELEASE_STATS[4].fetch_add(n, Ordering::Relaxed);
                 RELEASE_PENDING.fetch_sub(n, Ordering::AcqRel);
@@ -736,12 +794,28 @@ fn dispatch_releases(done: RetiredBatch, limit: u64) {
         done
     };
     let start = std::time::Instant::now();
-    drop(done);
+    drop_retired_batch(done);
     RELEASE_STATS[2].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
     RELEASE_STATS[5].fetch_add(n, Ordering::Relaxed);
 }
 
 fn release_line(frames: f64) {
+    let scratch = SCRATCH_RECYCLE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("scratch recycling per frame (VICTORY_SCRATCH_RECYCLE={}): {:.1} reused, {:.1} still referenced probes, {:.1} created, {:.1} quarantined; {:.0} duplicate list keeps avoided",
+        u8::from(scratch_recycle()), scratch[0], scratch[1], scratch[2], scratch[3], KEEP_ONCE_STATS.swap(0, Ordering::Relaxed) as f64 / frames);
+    if drop_detail() {
+        let kinds = DROP_KIND.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+        let cost = |i: usize| kinds[i + 6] as f64 / kinds[i + 3].max(1) as f64 * kinds[i] as f64 / frames / 1e6;
+        tracing::info!("release kinds per frame (sampled estimates): generic {:.0} / {:.2} ms, direct COM {:.0} / {:.2} ms, shared {:.0} / {:.2} ms",
+            kinds[0] as f64 / frames, cost(0), kinds[1] as f64 / frames, cost(1), kinds[2] as f64 / frames, cost(2));
+        if let Some(types) = DROP_TYPES.get() {
+            let mut rows: Vec<_> = types.lock().unwrap_or_else(|e| e.into_inner()).drain().collect();
+            rows.sort_unstable_by_key(|(_, (_, ns))| std::cmp::Reverse(*ns));
+            for (name, (n, ns)) in rows.into_iter().take(6) {
+                tracing::info!(name, samples = n, sampled_ms = ns as f64 / 1e6, "generic retirement sampled");
+            }
+        }
+    }
     let owners = SHARED_RETIRE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
     tracing::info!("shared resource retirement per frame (VICTORY_SHARED_RETIRE_COALESCE={}): {:.0} distinct queued owners, {:.0} redundant retirements coalesced, {:.0} owners released",
         u8::from(coalesce_retirements()), owners[0], owners[1], owners[2]);
@@ -2109,11 +2183,12 @@ fn scratch_pool() -> bool {
 struct Spare<T> {
     kept: Vec<(T, u64)>,
     bytes: u64,
+    probe: usize,
 }
 
 impl<T> Spare<T> {
     const fn new() -> Self {
-        Spare { kept: Vec::new(), bytes: 0 }
+        Spare { kept: Vec::new(), bytes: 0, probe: 0 }
     }
 
     /// A kept thing of `size` bytes, the one given last.
@@ -2121,6 +2196,28 @@ impl<T> Spare<T> {
         let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
+    }
+
+    // Probe a bounded rotating subset; an unavailable object stays kept
+    // but is never handed out until the caller's ownership test succeeds.
+    fn take_ready(&mut self, size: u64, mut ready: impl FnMut(&T) -> bool) -> Option<T> {
+        let len = self.kept.len();
+        if len == 0 { return None; }
+        let start = self.probe % len;
+        let mut tested = 0;
+        for offset in 0..len {
+            let at = (start + offset) % len;
+            let (thing, bytes) = &self.kept[at];
+            if *bytes != size { continue; }
+            self.probe = at + 1;
+            tested += 1;
+            if ready(thing) {
+                self.bytes -= size;
+                return Some(self.kept.swap_remove(at).0);
+            }
+            if tested >= 16 { break; }
+        }
+        None
     }
 
     /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
@@ -2137,6 +2234,32 @@ impl<T> Spare<T> {
 
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static KEEP_ONCE_STATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SCRATCH_RECYCLE_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn scratch_recycle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_RECYCLE").is_none_or(|v| v != "0"))
+}
+
+fn scratch_spare_limit() -> u64 {
+    let normal = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
+    if scratch_recycle() && crate::residency::pressured() && !crate::residency::critical_memory() {
+        32 << 20
+    } else {
+        crate::residency::cache_limit(normal, 64 << 20)
+    }
+}
+
+fn take_spare_chunk(size: u64) -> Option<Chunk> {
+    let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    if !scratch_recycle() { return spare.take(size); }
+    spare.take_ready(size, |chunk| {
+        let ready = references(&chunk.buffer) == 1;
+        if !ready { SCRATCH_RECYCLE_STATS[1].fetch_add(1, Ordering::Relaxed); }
+        ready
+    })
+}
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
@@ -2145,17 +2268,19 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
 
 fn take_chunk_with_growth(host: &Host, size: u64, grow: bool) -> Option<Chunk> {
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = take_spare_chunk(size)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
+        SCRATCH_RECYCLE_STATS[0].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
     if !grow {
         return None;
     }
     let (buffer, data) = host.upload_buffer(size)?;
+    SCRATCH_RECYCLE_STATS[2].fetch_add(1, Ordering::Relaxed);
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
@@ -2180,6 +2305,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         return;
     }
     let mut freed = Vec::new();
+    let limit = scratch_spare_limit();
     {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
@@ -2189,14 +2315,18 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 freed.push(chunk);
                 continue;
             }
-            let back = if scratch_pool() && references(&chunk.buffer) == 1 {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
-                let limit = crate::residency::cache_limit(limit, 64 << 20);
-                spare.give(chunk, size, limit)
+            let back = if scratch_pool() && limit != 0 {
+                let sole = references(&chunk.buffer) == 1;
+                // The old descriptor may keep this mapping for several
+                // submissions. Retain the owner, but not permission to write.
+                // Bound quarantined small chunks even on large machines.
+                let cap = if sole { limit } else if scratch_recycle() && size <= SCRATCH_FIRST {
+                    limit.min(32 << 20)
+                } else { 0 };
+                if !sole && cap != 0 && spare.bytes.saturating_add(size) <= cap {
+                    SCRATCH_RECYCLE_STATS[3].fetch_add(1, Ordering::Relaxed);
+                }
+                spare.give(chunk, size, cap)
             } else {
                 Some(chunk)
             };
@@ -2218,14 +2348,16 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
 }
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
-fn trim_spare_chunks() {
+fn trim_spare_chunks(limit: u64) {
     let freed: Vec<(Chunk, u64)> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
+        let mut freed = Vec::new();
+        while spare.bytes > limit {
+            let Some((chunk, size)) = spare.kept.pop() else { break; };
+            spare.bytes -= size;
+            freed.push((chunk, size));
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
+        freed
     };
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
@@ -2518,6 +2650,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Canonical IUnknown identities already held by keep(); pointers
+    /// cannot be reused while the retained IUnknown is alive.
+    kept_interfaces: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -7728,8 +7863,20 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+        static DEDUP: OnceLock<bool> = OnceLock::new();
+        if !*DEDUP.get_or_init(|| std::env::var_os("VICTORY_LIST_KEEP_ONCE").is_none_or(|v| v != "0")) {
+            if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+                self.deferred().kept.push(object);
+            }
+            return;
+        }
+        let Ok(owner) = object.cast::<windows::core::IUnknown>() else { return; };
+        let key = owner.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if deferred.kept_interfaces.insert(key) {
+            deferred.kept.push(owner);
+        } else {
+            KEEP_ONCE_STATS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -10353,6 +10500,20 @@ mod trail {
 #[cfg(test)]
 mod spare {
     use super::Spare;
+
+    #[test]
+    fn scratch_reuse_never_takes_a_busy_owner() {
+        let mut spare = Spare::new();
+        assert_eq!(spare.give(1, 4, 12), None);
+        assert_eq!(spare.give(2, 4, 12), None);
+        assert_eq!(spare.give(3, 4, 12), None);
+        assert_eq!(spare.take_ready(4, |x| *x == 2), Some(2));
+        assert_eq!(spare.bytes, 8);
+        assert_eq!(spare.take_ready(4, |_| false), None);
+        assert_eq!(spare.bytes, 8);
+        assert!(spare.take_ready(4, |_| true).is_some());
+        assert_eq!(spare.bytes, 4);
+    }
 
     /// Kept things come back by size, the last given first, and nothing is
     /// kept past the limit.
