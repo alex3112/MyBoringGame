@@ -115,6 +115,50 @@ pub(crate) fn texture_percent(configured: u64) -> u64 {
     configured.min(cap)
 }
 
+/// The optional local copies share a live DXGI ceiling, independent of
+/// the host-memory texture staging throttle.
+pub(crate) fn adaptive_vram() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ADAPTIVE_VRAM").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn local_target_percent() -> u64 {
+    static TARGET: OnceLock<u64> = OnceLock::new();
+    *TARGET.get_or_init(|| std::env::var("VICTORY_VRAM_TARGET_PERCENT").ok()
+        .and_then(|v| v.parse::<u64>().ok()).map_or(92, |v| v.clamp(80, 95)))
+}
+
+// Serialize shadow admissions through creation. DXGI and texture
+// allocations may still change residency independently.
+pub(crate) fn local_shadow_lock() -> std::sync::MutexGuard<'static, ()> {
+    static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ADMISSION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn local_shadow_room(memory: Option<[u64; 4]>, size: u64, legacy_percent: u64, optional: bool) -> bool {
+    if adaptive_vram() && optional && critical_memory() {
+        return false;
+    }
+    let percent = if adaptive_vram() { local_target_percent() } else { legacy_percent };
+    local_room_at(memory, size, percent, adaptive_vram() && optional)
+}
+
+fn local_room_at(memory: Option<[u64; 4]>, size: u64, percent: u64, require_budget: bool) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget != 0 => used.saturating_add(size) <= budget / 100 * percent,
+        _ => !require_budget,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn local_shadow_admission_respects_live_budget_and_unknown_budget() {
+    assert!(local_room_at(Some([1000 * MIB, 900 * MIB, 0, 0]), 20 * MIB, 92, true));
+    assert!(!local_room_at(Some([1000 * MIB, 900 * MIB, 0, 0]), 21 * MIB, 92, true));
+    assert!(!local_room_at(None, MIB, 92, true));
+    assert!(local_room_at(None, MIB, 92, false));
+}
+
 /// Limit idle caches, not snapshots still required by submitted work.
 pub(crate) fn cache_limit(normal: u64, compact: u64) -> u64 {
     if pressured() {
@@ -163,6 +207,11 @@ pub(crate) fn refresh() {
             local_used_mib = video[1] >> 20,
             shared_used_mib = video[3] >> 20,
             buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+            local_shadow_buffers_mib = crate::shadow::local_copy_bytes()[0] >> 20,
+            local_shadow_windows_mib = crate::shadow::local_copy_bytes()[1] >> 20,
+            local_mapped_windows_mib = crate::shadow::local_copy_bytes()[2] >> 20,
+            window_admission_refusals = ?crate::shadow::local_window_refusals(),
+            vram_target_percent = local_target_percent(),
             texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
             spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
             tiled_gpu_texture_mib = crate::tiles::given_total() >> 20,
@@ -179,6 +228,11 @@ pub(crate) fn refresh() {
                 physical_free_mib = physical >> 20,
                 available_commit_mib = commit >> 20,
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
+            local_shadow_buffers_mib = crate::shadow::local_copy_bytes()[0] >> 20,
+            local_shadow_windows_mib = crate::shadow::local_copy_bytes()[1] >> 20,
+            local_mapped_windows_mib = crate::shadow::local_copy_bytes()[2] >> 20,
+            window_admission_refusals = ?crate::shadow::local_window_refusals(),
+            vram_target_percent = local_target_percent(),
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
                 game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,

@@ -145,7 +145,7 @@ pub(crate) struct HostHeap {
     copied: Mutex<Vec<u8>>,
     /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
     /// by the frame they were found in.
-    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
+    waiting: Mutex<CopiedWaiting>,
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
@@ -159,6 +159,9 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// Dynamic slots alone can share COM ownership. Persistent bindless
+    /// slots retain the original independent references.
+    dynamic_kept: Box<[Mutex<Option<std::sync::Arc<crate::host::SlotResource>>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -905,6 +908,138 @@ const COPIED_FRAMES: u32 = 8;
 /// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
 const COPIED_GRACE: u64 = 4;
 
+fn indexed_copied_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WAIT_INDEXED").is_none_or(|v| v != "0"))
+}
+
+#[derive(Default)]
+struct CopiedWaiting {
+    legacy: std::collections::VecDeque<(u64, Vec<u32>)>,
+    due: std::collections::BTreeMap<u64, Vec<u32>>,
+    // The latest observation plus one; 0 means no pending entry.
+    latest: Vec<u64>,
+}
+
+static WAIT_DETAIL: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+impl CopiedWaiting {
+    fn push(&mut self, frame: u64, slots: Vec<u32>, count: usize, indexed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !indexed {
+            self.legacy.push_back((frame, slots));
+            return;
+        }
+        if self.latest.is_empty() {
+            self.latest.resize(count, 0);
+        }
+        let mut fresh = Vec::new();
+        let mut duplicate = 0;
+        for index in slots {
+            let Some(latest) = self.latest.get_mut(index as usize) else { continue };
+            if *latest == 0 {
+                fresh.push(index);
+            } else {
+                duplicate += 1;
+            }
+            *latest = (*latest).max(frame.saturating_add(1));
+        }
+        WAIT_DETAIL[0].fetch_add(fresh.len() as u64, Relaxed);
+        WAIT_DETAIL[1].fetch_add(duplicate, Relaxed);
+        if !fresh.is_empty() {
+            self.due.entry(frame).or_default().extend(fresh);
+        }
+    }
+
+    fn take(&mut self, frame: u64, indexed: bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        if !indexed {
+            while self.legacy.front().is_some_and(|(written, _)| written.saturating_add(COPIED_GRACE) <= frame) {
+                out.extend(self.legacy.pop_front().into_iter().flat_map(|(_, slots)| slots));
+            }
+            return out;
+        }
+        let mut rechecks = 0;
+        while self.due.first_key_value().is_some_and(|(&written, _)| written.saturating_add(COPIED_GRACE) <= frame) {
+            let (written, slots) = self.due.pop_first().expect("due entry");
+            for index in slots {
+                let latest = &mut self.latest[index as usize];
+                let observed = latest.saturating_sub(1);
+                out.push(index);
+                // The earliest deadline never moves. It reads the live slot,
+                // not an old record. Retain the latest future recheck if a
+                // newer observation also arrived, without intermediate duplicates.
+                if observed > written && observed.saturating_add(COPIED_GRACE) > frame {
+                    self.due.entry(observed).or_default().push(index);
+                    rechecks += 1;
+                } else {
+                    *latest = 0;
+                }
+            }
+        }
+        WAIT_DETAIL[2].fetch_add(rechecks, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn indexed_wait_preserves_earliest_deadline_and_latest_recheck() {
+    let mut waiting = CopiedWaiting::default();
+    waiting.push(10, vec![1, 1, 2], 8, true);
+    waiting.push(11, vec![1], 8, true);
+    waiting.push(12, vec![1, 3], 8, true);
+    assert!(waiting.take(13, true).is_empty());
+    assert_eq!(waiting.take(14, true), vec![1, 2]);
+    assert!(waiting.take(15, true).is_empty());
+    let mut due = waiting.take(16, true);
+    due.sort_unstable();
+    assert_eq!(due, vec![1, 3]);
+    waiting.push(17, vec![1], 8, true);
+    assert_eq!(waiting.take(21, true), vec![1]);
+}
+
+fn share_dynamic_resources() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_SHARED_REFS").is_none_or(|v| v != "0"))
+}
+
+type SlotRefs = std::collections::HashMap<usize, std::sync::Weak<crate::host::SlotResource>>;
+static DYNAMIC_REFS: std::sync::OnceLock<[Mutex<SlotRefs>; 64]> = std::sync::OnceLock::new();
+static DYNAMIC_REF_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn intern_slot_resource(resource: &ID3D12Resource) -> std::sync::Arc<crate::host::SlotResource> {
+    use std::sync::{Arc, atomic::Ordering::Relaxed};
+    use windows::core::Interface;
+    let key = resource.as_raw() as usize;
+    let shards = DYNAMIC_REFS.get_or_init(|| std::array::from_fn(|_| Mutex::default()));
+    let mut refs = shards[(key >> 4) & 63].lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(owner) = refs.get(&key).and_then(std::sync::Weak::upgrade) {
+        DYNAMIC_REF_STATS[0].fetch_add(1, Relaxed);
+        return owner;
+    }
+    // Bound dead weak entries. A live entry must never be replaced while
+    // slots or retired flights still hold its owner.
+    if refs.len() >= 1024 && refs.len().is_multiple_of(256) {
+        refs.retain(|_, owner| owner.strong_count() != 0);
+    }
+    let owner = Arc::new(crate::host::SlotResource(resource.clone()));
+    refs.insert(key, Arc::downgrade(&owner));
+    DYNAMIC_REF_STATS[1].fetch_add(1, Relaxed);
+    owner
+}
+
+pub(super) fn lifetime_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let waits = WAIT_DETAIL.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    let refs = DYNAMIC_REF_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "descriptor lifetime per frame (VICTORY_HEAP_WAIT_INDEXED={}, VICTORY_DYNAMIC_SHARED_REFS={}): {:.0} newly pending, {:.0} coalesced, {:.0} retained rechecks; {:.0} shared owner hits, {:.0} new owners, {:.0} unchanged dynamic slots, {:.0} shared owners retired",
+        u8::from(indexed_copied_wait()), u8::from(share_dynamic_resources()),
+        waits[0], waits[1], waits[2], refs[0], refs[1], refs[2], refs[3]
+    );
+}
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -1640,6 +1775,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            dynamic_kept: (0..if share_dynamic_resources() { extra } else { 0 }).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2944,8 +3080,39 @@ impl HostHeap {
         }
     }
 
+    /// Keep a dynamic slot's owner until precisely the same retirement
+    /// point as the old per-slot COM reference.
+    fn keep_dynamic(&self, index: u32, resource: Option<&ID3D12Resource>) -> bool {
+        use windows::core::Interface;
+        let Some(slot) = index.checked_sub(self.count).and_then(|at| self.dynamic_kept.get(at as usize)) else {
+            return false;
+        };
+        let old = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(|r| r.0.as_raw()) == resource.map(Interface::as_raw) {
+                DYNAMIC_REF_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+            std::mem::replace(&mut *slot, resource.map(intern_slot_resource))
+        };
+        if let Some(old) = old {
+            DYNAMIC_REF_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::host::retire_slot_resource(old);
+        }
+        true
+    }
+
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        if !self.keep_dynamic(index, resource) {
+            self.keep(index, resource.cloned());
+        }
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        if self.keep_dynamic(index, resource.as_ref()) {
+            return;
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -2967,6 +3134,9 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+        if let Some(slot) = index.checked_sub(self.count).and_then(|at| self.dynamic_kept.get(at as usize)) {
+            return slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|r| r.0.clone());
+        }
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -2999,7 +3169,7 @@ impl HostHeap {
         // (Bound by its handle, not read by index.)
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3044,7 +3214,7 @@ impl HostHeap {
         self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 1);
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3134,7 +3304,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -3231,18 +3401,15 @@ impl HostHeap {
     /// New records the title copied into slots `slots` in `frame` wait for
     /// the draw that may read them through a table.
     pub(crate) fn copied_wait(&self, frame: u64, slots: Vec<u32>) {
-        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, slots));
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner())
+            .push(frame, slots, self.count as usize, indexed_copied_wait());
     }
 
     /// The slots that have waited long enough at `frame`
     /// ([`HostHeap::copied_wait`]), each once.
     pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
-        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
-        }
-        drop(waiting);
+        let mut out = self.waiting.lock().unwrap_or_else(|e| e.into_inner())
+            .take(frame, indexed_copied_wait());
         out.sort_unstable();
         out.dedup();
         out

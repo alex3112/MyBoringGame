@@ -107,6 +107,8 @@ pub(crate) struct Shadow {
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
+    /// This allocation was created in a device-local DEFAULT heap.
+    local: bool,
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
@@ -245,7 +247,8 @@ fn card_limits() -> (u64, u64) {
         if card_priority() && !card_all() && explicit_max.is_none()
             && vram_budget.is_some_and(|budget| ((10u64 << 30)..=(12u64 << 30)).contains(&budget))
         {
-            max_bytes = max_bytes.max(768 << 20);
+            let max_mb = if crate::residency::adaptive_vram() { 1280 } else { 768 };
+            max_bytes = max_bytes.max(max_mb << 20);
         }
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
@@ -274,6 +277,13 @@ fn card_limits() -> (u64, u64) {
 
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static LOCAL_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+static LOCAL_WINDOW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn local_copy_bytes() -> [u64; 3] {
+    [LOCAL_CARD_BYTES.load(Ordering::Relaxed), LOCAL_WINDOW_BYTES.load(Ordering::Relaxed),
+        WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)]
+}
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
@@ -327,8 +337,8 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
-    const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let seen = if crate::residency::adaptive_vram() { 1280 << 20 } else { 1 << 30 };
+    card_limits().1.min(seen).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -371,8 +381,8 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = card_room_for(size);
+fn card_for(size: u64) -> Option<(ID3D12Resource, bool)> {
+    let there = card_room_for(size).map(|buffer| (buffer, true));
     if there.is_some() || !card_all() || size >= 1 << 30 {
         return there;
     }
@@ -383,7 +393,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((buffer, false))
 }
 
 /// Whether every title buffer's copy has two sides, however small
@@ -422,9 +432,12 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+    let _admission = crate::residency::local_shadow_lock();
+    let memory = host.video_memory();
+    if !crate::residency::local_shadow_room(memory, size, hundredths, false)
+        && let Some([budget, used, ..]) = memory
     {
+        let hundredths = if crate::residency::adaptive_vram() { crate::residency::local_target_percent() } else { hundredths };
         // Said, with the numbers it was decided by: run 193 made 31 copies
         // of 95 and no line named the others. The first 64, then every
         // 32nd.
@@ -465,6 +478,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    } else {
+        LOCAL_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
     }
     buffer
 }
@@ -490,7 +505,11 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let default = if crate::residency::adaptive_vram()
+            && host().and_then(|h| h.video_memory()).is_some_and(|[budget, ..]| budget >= 10 << 30)
+        { 1024 } else { 0 };
+        let mb = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
+        mb.saturating_mul(1 << 20)
     })
 }
 
@@ -499,8 +518,8 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let there = window_room_for(size);
+fn window_card_for(size: u64) -> Option<(ID3D12Resource, bool)> {
+    let there = window_room_for(size).map(|buffer| (buffer, true));
     if there.is_some() || !windows_own() || !cards() {
         return there;
     }
@@ -511,7 +530,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     }
     let (buffer, _) = host.shared_buffer(size)?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
-    Some(buffer)
+    Some((buffer, false))
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
@@ -534,6 +553,18 @@ fn window_mapped_most() -> u64 {
 
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+// Cumulative admission failures: budget/pressure, window cap, driver allocation.
+static WINDOW_ADMISSION: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn local_window_refusals() -> [u64; 3] {
+    WINDOW_ADMISSION.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
+fn window_reserve() -> u64 {
+    if crate::residency::adaptive_vram() {
+        card_room_kept().saturating_add(crate::resource::targets_room_kept())
+    } else { 0 }
+}
 
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
@@ -543,9 +574,15 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+    let _admission = crate::residency::local_shadow_lock();
+    if !crate::residency::local_shadow_room(host.video_memory(), size.saturating_add(window_reserve()), 80, true) {
+        WINDOW_ADMISSION[0].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if crate::residency::adaptive_vram() && window_card_most() != 0
+        && LOCAL_WINDOW_BYTES.load(Ordering::Relaxed).saturating_add(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)).saturating_add(size) > window_card_most()
     {
+        WINDOW_ADMISSION[1].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -555,6 +592,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        WINDOW_ADMISSION[2].fetch_add(1, Ordering::Relaxed);
     }
     made
 }
@@ -579,18 +617,26 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
+    let _admission = crate::residency::local_shadow_lock();
+    if !crate::residency::local_shadow_room(host.video_memory(), size.saturating_add(window_reserve()), 80, true) {
+        WINDOW_ADMISSION[0].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    let occupied = if crate::residency::adaptive_vram() {
+        LOCAL_WINDOW_BYTES.load(Ordering::Relaxed).saturating_add(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed))
+    } else {
+        WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+    };
+    if occupied.saturating_add(size) > most {
+        WINDOW_ADMISSION[1].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    if buffer.is_some() {
+        WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+        LOCAL_WINDOW_BYTES.fetch_add(size, Ordering::Relaxed);
+    } else {
+        WINDOW_ADMISSION[2].fetch_add(1, Ordering::Relaxed);
     }
     buffer
 }
@@ -2716,6 +2762,10 @@ impl Drop for Shadow {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
+            if card.local {
+                let counter = if window { &LOCAL_WINDOW_BYTES } else { &LOCAL_CARD_BYTES };
+                counter.fetch_sub(card.size, Ordering::Relaxed);
+            }
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
@@ -4678,6 +4728,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
+                local: false,
                 staging: none(),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
@@ -4834,6 +4885,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
+            local: false,
             staging: buffer,
             before: Mutex::default(),
             dirty: Mutex::default(),
@@ -5241,14 +5293,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
         let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+            Some((on_card, local)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
+                    len, local,
+                    "a buffer's host copy has two sides"
                 );
                 let card = Card {
+                    local,
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
@@ -5456,13 +5509,19 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
+    let admission = crate::residency::local_shadow_lock();
+    let room = crate::residency::local_shadow_room(host.video_memory(), len, 97, false);
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
+    let local = on_card.is_some();
+    if local {
+        LOCAL_WINDOW_BYTES.fetch_add(len, Ordering::Relaxed);
+    }
+    drop(admission);
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -5477,6 +5536,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
+        local,
         staging,
         before: Mutex::default(),
         dirty: Mutex::default(),
@@ -5634,9 +5694,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
     let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
+        Some((on_card, local)) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
+                local,
                 staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),

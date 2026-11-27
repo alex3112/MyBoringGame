@@ -86,7 +86,17 @@ enum Retired {
     Any(Box<dyn std::any::Any>),
     /// What a descriptor slot showed: 20,000 a frame, without a box each.
     Resource(ID3D12Resource),
+    SharedResource(std::sync::Arc<SlotResource>),
 }
+
+// D3D12 resources are free-threaded. A dynamic descriptor may keep the
+// same resource as thousands of others without each owning a COM reference.
+pub(crate) struct SlotResource(pub(crate) ID3D12Resource);
+// SAFETY: D3D12 resource methods and COM lifetime operations are free-threaded.
+unsafe impl Send for SlotResource {}
+// SAFETY: as above; the resource pointer itself is immutable.
+unsafe impl Sync for SlotResource {}
+
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
@@ -510,6 +520,19 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// Same eligibility rule as retire_resource, with a shared Rust owner.
+pub(crate) fn retire_slot_resource(object: std::sync::Arc<SlotResource>) {
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        drop(object);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::SharedResource(object)));
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -558,10 +581,15 @@ fn release_async() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_RELEASE_ASYNC").is_none_or(|v| v != "0"))
 }
 
+fn release_batched() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_RELEASE_BATCHED").is_none_or(|v| v != "0"))
+}
+
 fn release_worker() -> Option<&'static std::sync::mpsc::SyncSender<RetiredBatch>> {
     static WORKER: OnceLock<Option<std::sync::mpsc::SyncSender<RetiredBatch>>> = OnceLock::new();
     WORKER.get_or_init(|| {
-        let (send, receive) = std::sync::mpsc::sync_channel::<RetiredBatch>(2);
+        let (send, receive) = std::sync::mpsc::sync_channel::<RetiredBatch>(if release_batched() { 16 } else { 2 });
         std::thread::Builder::new().name("victory-release".into()).spawn(move || {
             while let Ok(batch) = receive.recv() {
                 let n = batch.len() as u64;
@@ -583,11 +611,30 @@ fn bury_relay(finished: u64) {
     if done.is_empty() {
         return;
     }
+    if !release_async() || !release_batched() {
+        dispatch_releases(done, 32768);
+        return;
+    }
+    // A landing can contain more than the entire old queue's capacity.
+    // Send bounded chunks rather than forcing that entire landing to drop
+    // synchronously. All objects have already passed take_retired's fence.
+    let limit = if crate::residency::critical_memory() { 32768 } else { 65536 };
+    let mut remaining = done.into_iter();
+    loop {
+        let batch: RetiredBatch = remaining.by_ref().take(4096).collect();
+        if batch.is_empty() {
+            break;
+        }
+        dispatch_releases(batch, limit);
+    }
+}
+
+fn dispatch_releases(done: RetiredBatch, limit: u64) {
     let n = done.len() as u64;
     let done = if release_async()
         && let Some(worker) = release_worker()
         && RELEASE_PENDING.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            pending.checked_add(n).filter(|&total| total <= 32768)
+            pending.checked_add(n).filter(|&total| total <= limit)
         }).is_ok()
     {
         match worker.try_send(done) {
@@ -611,7 +658,7 @@ fn bury_relay(finished: u64) {
 
 fn release_line(frames: f64) {
     let s = RELEASE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
-    tracing::info!(
+    tracing::info!(batched = release_batched(),
         "relay release per frame (VICTORY_RELAY_RELEASE_ASYNC={}): {:.2} ms collecting eligible objects, {:.0} queued, {:.2} ms synchronous drops ({} objects), {:.2} ms worker drops ({:.0} objects), {} outstanding; diagnostics {:.2} ms, final line update {:.2} ms",
         u8::from(release_async()), s[0] / 1000.0, s[1], s[2] / 1000.0, s[5],
         s[3] / 1000.0, s[4], RELEASE_PENDING.load(Ordering::Acquire), s[6] / 1000.0, s[7] / 1000.0
