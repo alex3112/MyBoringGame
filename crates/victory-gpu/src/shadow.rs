@@ -52,7 +52,7 @@ pub(crate) struct Shadow {
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    pending: Mutex<Ownership>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -102,6 +102,93 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// The live GPU-write ownership of one native allocation. The exact
+/// declarations are retained for Flights' producer counts. The disjoint
+/// coverage is derived from those declarations at the same lock boundary,
+/// never inferred from a guest address or from a completed GPU fence.
+#[derive(Default)]
+struct Ownership {
+    exact: Vec<(usize, usize)>,
+    covered: Vec<(usize, usize)>,
+}
+
+impl Ownership {
+    fn push(&mut self, range: (usize, usize)) {
+        self.exact.push(range);
+        let (mut from, mut to) = range;
+        if from >= to { return; }
+        let first = self.covered.partition_point(|r| r.1 < from);
+        let mut last = first;
+        while last < self.covered.len() && self.covered[last].0 <= to {
+            from = from.min(self.covered[last].0);
+            to = to.max(self.covered[last].1);
+            last += 1;
+        }
+        self.covered.splice(first..last, [(from, to)]);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&(usize, usize)) -> bool) {
+        let before = self.exact.len();
+        self.exact.retain(|r| keep(r));
+        if self.exact.len() != before {
+            self.covered = joined(self.exact.iter().copied().filter(|r| r.0 < r.1).collect());
+        }
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, (usize, usize)> { self.exact.iter() }
+    fn contains(&self, range: &(usize, usize)) -> bool { self.exact.contains(range) }
+    fn is_empty(&self) -> bool { self.exact.is_empty() }
+
+    fn overlaps(&self, from: usize, to: usize) -> &[(usize, usize)] {
+        let first = self.covered.partition_point(|r| r.1 <= from);
+        let last = first + self.covered[first..].partition_point(|r| r.0 < to);
+        &self.covered[first..last]
+    }
+
+    fn gaps(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let mut gaps = Vec::new();
+        let mut at = from;
+        for &(a, b) in self.overlaps(from, to) {
+            if at < a { gaps.push((at, a.min(to))); }
+            at = at.max(b);
+        }
+        if at < to { gaps.push((at, to)); }
+        gaps
+    }
+}
+
+fn versioned_ownership() -> bool {
+    crate::toggled!("VICTORY_VERSIONED_OWNERSHIP")
+}
+
+// Calls, requests with GPU-owned bytes, bytes not refreshed because of
+// ownership, gap requests proved current by CPU journal stamps, gap bytes.
+static VERSIONED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+pub(crate) fn versioned_line(frames: f64) {
+    let [calls, owned, gpu, clean, bytes] = VERSIONED.each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("versioned ownership per frame (VICTORY_VERSIONED_OWNERSHIP={}): {:.0} refresh decisions, {:.0} GPU-owned ranges, {:.2} MiB GPU-owned coverage, {:.0} clean CPU gaps, {:.2} MiB clean gap requests",
+        u8::from(versioned_ownership()), calls, owned, gpu / 1048576.0, clean, bytes / 1048576.0);
+}
+
+#[cfg(test)]
+#[test]
+fn ownership_preserves_overlapping_producers() {
+    let mut o = Ownership::default();
+    o.push((10, 30));
+    o.push((20, 40));
+    o.push((50, 60));
+    assert_eq!(o.gaps(0, 70), [(0, 10), (40, 50), (60, 70)]);
+    assert_eq!(o.gaps(25, 35), []);
+    o.retain(|r| *r != (10, 30));
+    assert_eq!(o.gaps(0, 70), [(0, 20), (40, 50), (60, 70)]);
+    o.push((40, 50));
+    assert_eq!(o.gaps(20, 60), []);
+    o.retain(|_| false);
+    assert_eq!(o.gaps(20, 60), [(20, 60)]);
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3797,7 +3884,12 @@ impl Shadow {
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if versioned_ownership() {
+            from < to && !pending.overlaps(from, to).is_empty()
+        } else {
+            pending.iter().any(|&(a, e)| a < to && e > from)
+        }
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3817,14 +3909,15 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if versioned_ownership() && crate::watch::light() {
+                pending.overlaps(from, to).iter().map(|&(a,e)| (a.max(from), e.min(to))).collect()
+            } else {
+                pending.iter().filter(|&&(a,e)| a < to && e > from)
+                    .map(|&(a,e)| (a.max(from), e.min(to))).collect()
+            }
+        };
         if busy.is_empty() {
             return false;
         }
@@ -3861,14 +3954,15 @@ impl Shadow {
         if from >= to {
             return false;
         }
-        let busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
-            .collect();
+        let busy: Vec<(usize, usize)> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if versioned_ownership() && crate::watch::light() {
+                pending.overlaps(from, to).iter().map(|&(a,e)| (a.max(from), e.min(to))).collect()
+            } else {
+                pending.iter().filter(|&&(a,e)| a < to && e > from)
+                    .map(|&(a,e)| (a.max(from), e.min(to))).collect()
+            }
+        };
         if busy.is_empty() {
             return false;
         }
@@ -3880,7 +3974,7 @@ impl Shadow {
         // dozens of offsets): as one range each page is asked about and
         // compared once. Every byte of it is in a declared range, and of a
         // copy in the PC's memory in the snapshot.
-        let busy = if crate::watch::light() { joined(busy) } else { busy };
+        let busy = if crate::watch::light() && !versioned_ownership() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
@@ -4054,6 +4148,37 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // The producer index partitions the request into GPU-owned bytes
+        // and CPU-authoritative gaps. GPU ownership is retained until the
+        // existing flight count reaches zero after landing. CPU changes
+        // under in-flight writes still go through merge_under_writes.
+        if versioned_ownership() && crate::watch::light() {
+            VERSIONED[0].fetch_add(1, Ordering::Relaxed);
+            let gaps = {
+                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                if pending.overlaps(from, to).is_empty() {
+                    None
+                } else {
+                    Some(pending.gaps(from, to))
+                }
+            };
+            if let Some(gaps) = gaps {
+                VERSIONED[1].fetch_add(1, Ordering::Relaxed);
+                let cpu: usize = gaps.iter().map(|&(a,b)| b-a).sum();
+                VERSIONED[2].fetch_add((to - from - cpu) as u64, Ordering::Relaxed);
+                let mut bytes = 0;
+                for (a, b) in gaps {
+                    if self.cpu_version_current(a, b) {
+                        VERSIONED[3].fetch_add(1, Ordering::Relaxed);
+                        VERSIONED[4].fetch_add((b - a) as u64, Ordering::Relaxed);
+                    } else {
+                        bytes += self.update_free(a, b);
+                    }
+                }
+                return bytes;
+            }
+            return self.update_free(from, to);
+        }
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4097,12 +4222,24 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
-        // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        // A whole request with matching CPU journal versions is current
+        // even if its native buffer is newer in a GPU-owned subrange.
+        // This is a refresh decision only, never permission to read title
+        // memory or to bypass the in-flight CPU-write reconciliation.
+        if !versioned_ownership() && self.writes_pending_in(from, to) {
+            return false;
+        }
+        self.cpu_version_current(from, to)
+    }
+
+    /// Check only a CPU journal version, not the contents of GPU memory.
+    /// No stamp is advanced and no CPU visibility is asserted here.
+    fn cpu_version_current(&self, from: usize, to: usize) -> bool {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4935,7 +5072,14 @@ impl Shadow {
         let Some(at) = copied.get_mut(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        // A whole-range CPU stamp is just as authoritative as a page
+        // stamp when it covers every byte of this block in the copy.
+        let stamp = if versioned_ownership() {
+            let from = (block * PAGE).max(self.start as usize);
+            let to = ((block + 1) * PAGE).min((self.start + self.len) as usize);
+            (*at).max(self.ranged(from, to))
+        } else { *at };
+        let held = stamp != 0 && stamp >= before && crate::watch::block_published(block);
         if held {
             *at = (*at).max(now);
         }

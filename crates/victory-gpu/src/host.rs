@@ -4292,6 +4292,7 @@ fn late_line(frames: f64) {
     place::ownership_line(frames);
     crate::shadow::dirty_card_line(frames);
     crate::shadow::backing_line(frames);
+    crate::shadow::versioned_line(frames);
     card_steps::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
