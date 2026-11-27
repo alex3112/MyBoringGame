@@ -461,6 +461,7 @@ struct Asked {
     started: std::time::Instant,
     manual: bool,
     sample_threads: bool,
+    trigger: std::path::PathBuf,
 }
 
 /// `<from s>[+<from s>..],<frames>,<file>`, or a file alone.
@@ -498,13 +499,18 @@ fn asked() -> Option<&'static Asked> {
             // Keep it off by default for a minimally intrusive manual capture.
             let sample_threads = std::env::var_os("VICTORY_TIMELINE_SAMPLE")
                 .map_or(!manual, |v| v != "0");
+            let file = std::path::PathBuf::from(file);
+            let trigger = std::env::var_os("VICTORY_TIMELINE_TRIGGER")
+                .filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+                .unwrap_or_else(|| file.with_extension("trigger"));
             Some(Asked {
-                file: file.into(),
+                file,
                 after,
                 frames: frames.clamp(1, 60),
                 started: std::time::Instant::now(),
                 manual,
                 sample_threads,
+                trigger,
             })
         })
         .as_ref()
@@ -539,6 +545,10 @@ pub(crate) fn presented() {
         writing: false,
         before: None,
     });
+    static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+    ANNOUNCED.call_once(|| {
+        tracing::info!(file = %asked.file.display(), trigger = %asked.trigger.display(), manual = asked.manual, frames = asked.frames, "critical-path profiler armed (VICTORY_TIMELINE); manual: hold F9 or create trigger file");
+    });
     let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(&after) = asked.after.get(stage.made) else {
         return;
@@ -547,12 +557,21 @@ pub(crate) fn presented() {
         return;
     }
     if asked.manual && !stage.ready {
-        // Poll at the title's presents; hold F9 until the armed line appears.
+        // A persistent file request cannot be missed between presents or
+        // depend on keyboard focus. Consume it once before beginning.
+        let requested = match std::fs::remove_file(&asked.trigger) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| tracing::warn!(error = %e, trigger = %asked.trigger.display(), "could not consume timeline trigger file"));
+                false
+            }
+        };
         // SAFETY: plain keyboard-state query, no hook or input consumption.
-        if unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x78) } >= 0 {
-            return;
-        }
-        tracing::info!("F9: preparing critical-path timeline");
+        let key = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x78) } < 0;
+        if !requested && !key { return; }
+        tracing::info!(source = if requested { "file" } else { "F9" }, "critical-path capture requested");
     }
     if !stage.ready {
         // The buffers, the card's lists and the threads' clocks take a
@@ -560,6 +579,7 @@ pub(crate) fn presented() {
         stage.ready = true;
         make_room();
         crate::host::timeline_ready();
+        tracing::info!("critical-path profiler preparation complete");
         return;
     }
     if !stage.began {
@@ -579,6 +599,7 @@ pub(crate) fn presented() {
         return;
     }
     stage.writing = true;
+    tracing::info!(frames = stage.frames, "critical-path frames captured; collecting events and writing reports");
     let before = stage.before.take().unwrap_or_default();
     // Several recordings: a file each.
     let file = match asked.after.len() {
@@ -594,6 +615,7 @@ pub(crate) fn presented() {
         // The spans under way at the last present end first.
         std::thread::sleep(std::time::Duration::from_millis(250));
         let data = end();
+        tracing::info!(events = data.events.len(), lost = data.lost, file = %file.display(), "critical-path events collected; building report");
         super::report::write(&file, data, &before, &after, crate::host::timeline_stamps());
         crate::host::timeline_restart();
         let mut stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
