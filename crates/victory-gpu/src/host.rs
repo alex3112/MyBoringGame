@@ -4221,6 +4221,8 @@ mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
+mod afmf;
+mod settings_menu;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -10031,6 +10033,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            settings_menu::start(hwnd);
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
