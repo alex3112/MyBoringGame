@@ -2,8 +2,9 @@
 //! implementation. Both IAT binding and dynamic GetProcAddress are covered.
 //! The documented SDK 1.1.4 and modular SDK layouts agree for these common
 //! descriptor IDs. Xbox-specific/unknown IDs are logged, never interpreted.
-//! ReadProcessMemory bounds diagnostic reads; no title descriptors are changed.
+//! ReadProcessMemory bounds reads. An explicit sharpening override uses an aligned local copy; the title descriptor is never written.
 use std::ffi::c_void;
+use victory_core::fsr::{self, Sharpening, Status};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
@@ -27,6 +28,7 @@ static ORIGINAL: [[AtomicUsize; 5]; 3] = [const { [const { AtomicUsize::new(0) }
 static CALLS: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
 static ERRORS: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
 static ENABLED: OnceLock<bool> = OnceLock::new();
+static CONTROLS: OnceLock<bool> = OnceLock::new();
 
 pub fn is_module(file: &str) -> bool {
     MODULES.iter().any(|m| m.eq_ignore_ascii_case(file))
@@ -35,12 +37,12 @@ pub fn is_module(file: &str) -> bool {
 /// Keep distinct original exports for the loader and each provider: the
 /// loader may call an intercepted provider, and must not recurse into itself.
 pub fn wrap(file: &str, name: &str, original: usize) -> usize {
-    if original == 0 || !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_FFX_AUDIT").is_none_or(|v| v != "0")) {
+    if original == 0 || !*CONTROLS.get_or_init(|| std::env::var_os("VICTORY_FFX_CONTROLS").is_none_or(|v| v != "0")) {
         return original;
     }
     let Some(module) = MODULES.iter().position(|m| m.eq_ignore_ascii_case(file)) else { return original };
     let Some(op) = NAMES.iter().position(|n| *n == name) else {
-        tracing::info!(module = file, export = name, "FFX audit: other title export (unchanged)");
+        if audit_enabled() { tracing::info!(module = file, export = name, "FFX audit: other title export (unchanged)"); }
         return original;
     };
     let hook = match module {
@@ -102,13 +104,17 @@ fn valid_size(d: [u32; 2]) -> bool {
 fn context_value(context: *mut c_void) -> u64 {
     read::<8>(context as usize).map_or(0, |b| u64_at(&b, 0))
 }
+fn audit_enabled() -> bool {
+    cfg!(feature = "diagnostics") && *ENABLED.get_or_init(|| std::env::var_os("VICTORY_FFX_AUDIT").is_none_or(|v| v != "0"))
+}
+
 fn sample(n: u64) -> bool {
     n <= 8 || n.is_power_of_two()
 }
 
 fn before<const M: usize>(op: usize, context: *mut c_void, desc: *const c_void) -> (u64, u64) {
     let n = CALLS[M][op].fetch_add(1, Ordering::Relaxed) + 1;
-    if !sample(n) { return (n, 0); }
+    if !audit_enabled() || !sample(n) { return (n, 0); }
     let header = read::<16>(desc as usize);
     let kind = header.as_ref().map_or(0, |b| u64_at(b, 0));
     let next = header.as_ref().map_or(0, |b| u64_at(b, 8));
@@ -185,7 +191,7 @@ fn before<const M: usize>(op: usize, context: *mut c_void, desc: *const c_void) 
 
 fn after<const M: usize>(op: usize, n: u64, kind: u64, context: *mut c_void, rc: u32) {
     let errors = if rc != 0 { ERRORS[M][op].fetch_add(1, Ordering::Relaxed) + 1 } else { 0 };
-    if sample(n) || (errors != 0 && sample(errors)) {
+    if audit_enabled() && (sample(n) || (errors != 0 && sample(errors))) {
         let value = if op == CREATE && rc == 0 { context_value(context) } else { 0 };
         tracing::info!(module = MODULES[M], call = NAMES[op], n, descriptor = format_args!("{kind:#x}"),
             result = rc, errors, created_context = format_args!("{value:#x}"), "FFX audit: title result");
@@ -215,6 +221,7 @@ unsafe extern "C" fn destroy<const M: usize>(context: *mut c_void, alloc: *const
     let rc = unsafe { f(context, alloc) };
     let last_error = unsafe { GetLastError() };
     after::<M>(DESTROY, n, kind, context, rc);
+    if M == 0 && rc == 0 { fsr::clear(); }
     unsafe { SetLastError(last_error) };
     rc
 }
@@ -226,7 +233,7 @@ fn invoke<const M: usize, const OP: usize>(context: *mut c_void, desc: *const c_
     let rc = unsafe { f(context, desc) };
     let last_error = unsafe { GetLastError() };
     after::<M>(OP, n, kind, context, rc);
-    if OP == QUERY && sample(n) && rc == 0 {
+    if OP == QUERY && audit_enabled() && sample(n) && rc == 0 {
         if kind == 6 {
             if let Some(b) = read::<32>(desc as usize) {
                 let address = u64_at(&b, 24) as usize;
@@ -258,8 +265,82 @@ unsafe extern "C" fn configure<const M: usize>(context: *mut c_void, desc: *cons
 unsafe extern "C" fn query<const M: usize>(context: *mut c_void, desc: *mut c_void) -> u32 {
     invoke::<M, QUERY>(context, desc)
 }
+// Layout validated by the title's build 0.131 audit. Unknown descriptor
+// chains or sizes are passed through, not reinterpreted. Only the outer
+// loader dispatch is modified, so nested provider calls see the same copy.
+#[repr(C, align(8))]
+struct UpscaleBytes([u8; 432]);
+
+fn upscale_bytes(desc: *const c_void) -> Option<UpscaleBytes> {
+    let header = read::<16>(desc as usize)?;
+    if u64_at(&header, 0) != 0x0001_0001 || u64_at(&header, 8) != 0 { return None; }
+    let b = read::<432>(desc as usize)?;
+    let render = dims(&b, 376);
+    let output = dims(&b, 384);
+    if !valid_size(render) || !valid_size(output)
+        || b[392] > 1 || b[408] > 1
+        || !f32_at(&b, 396).is_finite()
+        || [0, 1, 2, 6].into_iter().any(|i| u64_at(&b, 24 + i * 48) == 0)
+    {
+        return None;
+    }
+    Some(UpscaleBytes(b))
+}
+
+fn apply_sharpening(b: &mut [u8; 432], requested: Sharpening) {
+    match requested {
+        Sharpening::Game => {}
+        Sharpening::Off => {
+            b[392] = 0;
+            b[396..400].copy_from_slice(&0.0f32.to_le_bytes());
+        }
+        Sharpening::On(p) => {
+            b[392] = 1;
+            b[396..400].copy_from_slice(&(f32::from(p.min(100)) / 100.0).to_le_bytes());
+        }
+    }
+}
+
 unsafe extern "C" fn dispatch<const M: usize>(context: *mut c_void, desc: *const c_void) -> u32 {
-    invoke::<M, DISPATCH>(context, desc)
+    if M != 0 {
+        return invoke::<M, DISPATCH>(context, desc);
+    }
+    let previous_error = unsafe { GetLastError() };
+    let requested = fsr::request();
+    let mut snapshot = upscale_bytes(desc);
+    let actual = if let Some(b) = snapshot.as_mut() {
+        apply_sharpening(&mut b.0, requested);
+        if requested != Sharpening::Game { std::ptr::from_ref(b).cast() } else { desc }
+    } else {
+        desc
+    };
+    unsafe { SetLastError(previous_error) };
+    let rc = invoke::<M, DISPATCH>(context, actual);
+    let last_error = unsafe { GetLastError() };
+    if let Some(b) = snapshot {
+        let state = Status {
+            render: dims(&b.0, 376), upscale: dims(&b.0, 384),
+            sharpening: b.0[392] != 0,
+            sharpness: (f32_at(&b.0, 396).clamp(0.0, 1.0) * 100.0).round() as u8,
+            applied: requested, result: rc,
+        };
+        if fsr::status() != Some(state) {
+            tracing::info!(?state, "FFX runtime: title sharpening dispatch");
+        }
+        fsr::publish(state);
+        let n = CALLS[M][DISPATCH].load(Ordering::Relaxed);
+        if rc == 0 && audit_enabled() && sample(n) {
+            let ids = [0, 1, 2, 6];
+            fsr::observe(ids.map(|i| u64_at(&b.0, 24 + i * 48) as usize),
+                ids.map(|i| dims(&b.0, 40 + i * 48)));
+        }
+    } else if read::<16>(desc as usize).is_some_and(|b| u64_at(&b, 0) == 0x0001_0001) {
+        // A new incompatible upscale descriptor must not leave the menu
+        // advertising an applied override from an older dispatch.
+        fsr::clear();
+    }
+    unsafe { SetLastError(last_error) };
+    rc
 }
 
 #[cfg(test)]
@@ -274,6 +355,21 @@ mod tests {
     fn sampled_calls_are_bounded() {
         assert!(sample(1) && sample(8) && sample(1024));
         assert!(!sample(9) && !sample(1023));
+    }
+    #[test]
+    fn sharpening_override_preserves_other_fields() {
+        let mut b = [0x55; 432];
+        let original = b;
+        apply_sharpening(&mut b, Sharpening::Game);
+        assert_eq!(b, original);
+        apply_sharpening(&mut b, Sharpening::On(40));
+        assert_eq!(b[392], 1);
+        assert_eq!(f32_at(&b, 396), 0.4);
+        assert_eq!(&b[..392], &original[..392]);
+        assert_eq!(&b[400..], &original[400..]);
+        apply_sharpening(&mut b, Sharpening::Off);
+        assert_eq!(b[392], 0);
+        assert_eq!(f32_at(&b, 396), 0.0);
     }
     #[test]
     fn diagnostic_read_of_own_memory() {

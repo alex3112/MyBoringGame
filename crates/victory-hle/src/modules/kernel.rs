@@ -159,7 +159,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         let address = host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(windows)]
         if !address.is_null() && name as usize >= 0x1_0000
             && let Some(path) = runtime::image_path(module as usize)
             && let Some(file) = path.file_name().and_then(|f| f.to_str())

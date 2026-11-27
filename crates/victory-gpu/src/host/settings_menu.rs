@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::{Host, HostList};
+use victory_core::fsr::{self, Sharpening, Status};
 
 static OPEN: AtomicBool = AtomicBool::new(false);
 pub(crate) fn is_open() -> bool {
@@ -25,7 +26,7 @@ pub(crate) fn is_open() -> bool {
 }
 
 const W: u32 = 800;
-const H: u32 = 410;
+const H: u32 = 535;
 const BG: [u8; 3] = [14, 25, 45];
 const BLUE: [u8; 3] = [31, 65, 123];
 const BUTTON: [u8; 3] = [27, 45, 76];
@@ -46,9 +47,12 @@ impl Hit {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
 }
-const PROBE: Hit = Hit { x: 390, y: 180, w: 382, h: 43 };
-const CAPTURE: Hit = Hit { x: 390, y: 232, w: 382, h: 43 };
-const CLOSE: Hit = Hit { x: 558, y: 351, w: 214, h: 40 };
+const SHARP: Hit = Hit { x: 390, y: 194, w: 382, h: 37 };
+const MINUS: Hit = Hit { x: 390, y: 238, w: 55, h: 37 };
+const PLUS: Hit = Hit { x: 717, y: 238, w: 55, h: 37 };
+const RESET: Hit = Hit { x: 390, y: 282, w: 382, h: 37 };
+const PROBE: Hit = Hit { x: 390, y: 367, w: 382, h: 37 };
+const CLOSE: Hit = Hit { x: 558, y: 477, w: 214, h: 40 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Layout {
@@ -255,14 +259,17 @@ pub(super) struct Menu {
     revision: u64,
     probe: Option<Receiver<Result<String, String>>>,
     picture: Option<Picture>,
+    fsr_status: Option<Status>,
+    strength: u8,
 }
 impl Menu {
     pub(super) fn new() -> Self {
         OPEN.store(false, Ordering::Release);
+        fsr::register_observer(observe_resources);
         Self {
             down: false, mouse_down: false, escape_down: false,
-            status: "Native interpolation unavailable until depth and motion vectors are mapped.".into(),
-            revision: 0, probe: None, picture: None,
+            status: "FSR sharpening controls the title's original upscaler. No second upscaler.".into(),
+            revision: 0, probe: None, picture: None, fsr_status: None, strength: 30,
         }
     }
 
@@ -285,15 +292,30 @@ impl Menu {
                     Err(e) => self.status(format!("Could not start SDK check: {e}")),
                 }
             }
-            #[cfg(feature = "diagnostics")]
-            2 => match crate::capture::request_fsr() {
-                Ok(()) => {
-                    self.status("Capture scheduled. Move the camera; see the launch log.".into());
-                    OPEN.store(false, Ordering::Release);
-                }
-                Err(e) => self.status(e),
-            },
             3 => OPEN.store(false, Ordering::Release),
+            4 if self.fsr_status.is_some() => {
+                let enabled = match fsr::request() {
+                    Sharpening::Game => self.fsr_status.is_some_and(|s| s.sharpening),
+                    Sharpening::Off => false,
+                    Sharpening::On(_) => true,
+                };
+                fsr::set_request(if enabled { Sharpening::Off } else { Sharpening::On(self.strength) });
+                self.status("Sharpening change requested; waiting for the title's next FSR dispatch.".into());
+            }
+            5 | 6 if self.fsr_status.is_some() => {
+                let current = match fsr::request() {
+                    Sharpening::On(p) => p,
+                    _ => self.fsr_status.map_or(0, |s| s.sharpness),
+                };
+                self.strength = if hover == 5 { current.saturating_sub(5) }
+                    else { current.saturating_add(5).min(100) };
+                fsr::set_request(Sharpening::On(self.strength));
+                self.status("Sharpness change requested; waiting for the next FSR dispatch.".into());
+            }
+            7 if self.fsr_status.is_some() => {
+                fsr::set_request(Sharpening::Game);
+                self.status("Restoring the title's original sharpening parameters.".into());
+            }
             _ => {}
         }
     }
@@ -323,21 +345,42 @@ impl Menu {
         let mut c = Canvas::new(layout)?;
         c.rect(Hit { x: 0, y: 0, w: W, h: H }, BG);
         c.rect(Hit { x: 16, y: 55, w: 768, h: 39 }, BLUE);
-        c.rect(Hit { x: 390, y: 128, w: 382, h: 43 }, BUTTON);
-        for (id, rect) in [(1, PROBE), (2, CAPTURE), (3, CLOSE)] {
+        for (id, rect) in [(1, PROBE), (3, CLOSE), (4, SHARP), (5, MINUS), (6, PLUS), (7, RESET)] {
             c.rect(rect, if hover == id { HOVER } else if id == 3 { BLUE } else { BUTTON });
         }
-        c.rect(Hit { x: 28, y: 286, w: 744, h: 1 }, [54, 76, 110]);
+        c.rect(Hit { x: 450, y: 238, w: 262, h: 37 }, BUTTON);
+        c.rect(Hit { x: 28, y: 414, w: 744, h: 1 }, [54, 76, 110]);
         c.text(27, 14, "VIctory", 28, true, ACCENT);
         c.text(627, 23, crate::BUILD_VERSION, 16, false, MUTED);
         c.text(28, 63, "Graphics Settings", 22, true, TEXT);
-        c.text(28, 103, "AMD FidelityFX Frame Generation", 17, true, ACCENT);
-        c.text(28, 139, "Frame Generation", 20, false, TEXT);
-        c.text(411, 140, "Off - inputs not mapped", 19, false, MUTED);
-        c.text(28, 191, "FidelityFX SDK", 20, false, TEXT);
-        c.text(411, 191, "Check SDK", 19, true, TEXT);
-        c.text(28, 243, "Engine input audit", 20, false, TEXT);
-        c.text(411, 243, if cfg!(feature = "diagnostics") { "Capture FSR inputs" } else { "Diagnostics build required" }, 18, true, if cfg!(feature = "diagnostics") { TEXT } else { MUTED });
+        c.text(28, 103, "AMD FidelityFX Upscaling", 17, true, ACCENT);
+        c.text(28, 133, "FSR Upscaling", 20, false, TEXT);
+        c.text(400, 133, if self.fsr_status.is_some_and(|s| s.result == 0) { "Active (original Xbox)" } else { "Waiting for title dispatch" }, 19, false, MUTED);
+        c.text(28, 164, "Render / output resolution", 20, false, TEXT);
+        let dimensions = self.fsr_status.map_or("Not available".into(), |s| format!("{}x{}  /  {}x{}", s.render[0], s.render[1], s.upscale[0], s.upscale[1]));
+        c.text(400, 164, &dimensions, 19, false, MUTED);
+        c.text(28, 202, "Sharpening", 20, false, TEXT);
+        let requested = fsr::request();
+        let state = self.fsr_status;
+        let mode = match requested {
+            Sharpening::Game => if state.is_some_and(|s| s.sharpening) { "Game default (On)" } else { "Game default (Off)" },
+            Sharpening::Off => "Off",
+            Sharpening::On(_) => "On",
+        };
+        let suffix = if state.is_some_and(|s| s.result != 0) { " - SDK error" } else if state.is_some_and(|s| s.applied != requested) { " - pending" } else { "" };
+        c.text(411, 202, &format!("{mode}{suffix}"), 19, true, if state.is_some() { TEXT } else { MUTED });
+        c.text(28, 246, "Sharpness", 20, false, TEXT);
+        c.text(407, 246, "-", 20, true, TEXT);
+        c.text(735, 246, "+", 20, true, TEXT);
+        let strength = match requested { Sharpening::On(p) => p, _ => state.map_or(0, |s| s.sharpness) };
+        c.text(525, 246, &format!("{strength}%"), 20, true, TEXT);
+        c.text(28, 290, "Restore title defaults", 20, false, TEXT);
+        c.text(411, 290, "Reset sharpening", 19, true, TEXT);
+        c.text(28, 329, "AMD Frame Generation", 17, true, ACCENT);
+        c.text(28, 351, "Frame Generation", 20, false, TEXT);
+        c.text(400, 351, "Off - native dispatch not integrated", 17, false, MUTED);
+        c.text(28, 377, "FidelityFX SDK", 20, false, TEXT);
+        c.text(411, 377, "Check SDK", 19, true, TEXT);
         // Keep arbitrary loader error messages inside the panel.
         let mut lines = vec![String::new()];
         for word in self.status.split_whitespace() {
@@ -351,10 +394,10 @@ impl Menu {
         }
         for (n, line) in lines.iter().enumerate() {
             let short: String = line.chars().take(92).collect();
-            c.text(28, 296 + n as u32 * 17, &short, 15, false, MUTED);
+            c.text(28, 424 + n as u32 * 17, &short, 15, false, MUTED);
         }
-        c.text(28, 362, "² / Esc: close", 17, false, MUTED);
-        c.text(634, 362, "Close", 19, true, TEXT);
+        c.text(28, 488, "² / Esc: close", 17, false, MUTED);
+        c.text(634, 488, "Close", 19, true, TEXT);
         if let Some((x,y)) = cursor {
             c.text(x.min(W-24), y.min(H-25), "↖", 24, true, TEXT);
         }
@@ -400,6 +443,15 @@ impl Menu {
             return;
         }
         self.poll_probe();
+        let current = fsr::status();
+        if self.fsr_status != current {
+            self.fsr_status = current;
+            if let Some(s) = current && s.applied == fsr::request() {
+                self.status(if s.result == 0 { format!("Title FSR accepted sharpening: {} ({}%).", if s.sharpening { "On" } else { "Off" }, s.sharpness) } else { format!("Title FSR dispatch returned error {}.", s.result) });
+            } else {
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
         let Some(layout) = Layout::new(size) else {
             OPEN.store(false, Ordering::Release);
             return;
@@ -407,8 +459,11 @@ impl Menu {
         let pos = pointer(hwnd, size, layout);
         let hover = pos.map_or(0, |p| {
             if PROBE.contains(p) { 1 }
-            else if cfg!(feature = "diagnostics") && CAPTURE.contains(p) { 2 }
             else if CLOSE.contains(p) { 3 }
+            else if self.fsr_status.is_some() && SHARP.contains(p) { 4 }
+            else if self.fsr_status.is_some() && MINUS.contains(p) { 5 }
+            else if self.fsr_status.is_some() && PLUS.contains(p) { 6 }
+            else if self.fsr_status.is_some() && RESET.contains(p) { 7 }
             else { 0 }
         });
         if clicked { self.action(hover); }
@@ -448,6 +503,30 @@ impl Menu {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
             copy.list.CopyTextureRegion(&to, layout.x, layout.y, 0, &from, None);
+        }
+    }
+}
+
+// Called synchronously on the title thread, while the dispatch owns these
+// resources. Never allocate a texture, transition its state or retain the
+// title pointer here. THIN can defer actual writes; an existing native
+// texture is evidence of identity only, not a synchronization guarantee.
+fn observe_resources(resources: [usize; 4], dimensions: [[u32; 2]; 4]) {
+    use windows::core::Interface;
+    for (i, label) in ["color", "depth", "motion_vectors", "output"].iter().enumerate() {
+        let title = resources[i] as crate::object::This;
+        if !crate::resource::is_resource(title) {
+            tracing::warn!(input = *label, title = resources[i], "FFX bridge: not a recognized title resource");
+            continue;
+        }
+        if let Some(copy) = crate::resource::made_copy(title) {
+            let desc = unsafe { copy.texture.GetDesc() };
+            let matches_size = desc.Width == u64::from(dimensions[i][0]) && desc.Height == dimensions[i][1];
+            tracing::info!(input = *label, title = resources[i], native = copy.texture.as_raw() as usize,
+                width = desc.Width, height = desc.Height, format = desc.Format.0, matches_size,
+                "FFX bridge: existing native texture");
+        } else {
+            tracing::info!(input = *label, title = resources[i], "FFX bridge: native texture not yet materialized");
         }
     }
 }
