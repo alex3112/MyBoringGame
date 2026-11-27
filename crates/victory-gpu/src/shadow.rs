@@ -3260,6 +3260,22 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// Same refresh and declaration as separate calls, under one
+    /// recording lock. In-place copies still require the refresh step
+    /// but do not declare a CPU copy-back.
+    pub(crate) fn access(self: &Arc<Self>, list: &HostList, address: u64, len: u64, write: bool) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_COMBINE_ACCESS").is_none_or(|v| v != "0")) {
+            self.refresh(list, address, len);
+            if write { self.gpu_writes(list, address, len); }
+            return;
+        }
+        let len = len.min(self.left(address));
+        let write = write && self.place.is_none();
+        if write { self.written.store(true, Ordering::Relaxed); }
+        list.defer_access(self, address as usize, len as usize, write);
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.

@@ -24,6 +24,40 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+static BIND_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static BIND_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+struct BindSample {
+    last: std::time::Instant,
+}
+impl BindSample {
+    fn start() -> Option<Self> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_BIND_PROFILE").is_none_or(|v| v != "0")) { return None; }
+        // Per invocation, rather than one entire command list at a time.
+        thread_local! { static TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+        let sample = TICK.with(|tick| { let n = tick.get(); tick.set(n.wrapping_add(1)); n % 64 == 0 });
+        if !sample { return None; }
+        BIND_SAMPLE.fetch_add(1, Ordering::Relaxed);
+        Some(Self { last: std::time::Instant::now() })
+    }
+    fn part(sample: &mut Option<Self>, part: usize) {
+        if let Some(sample) = sample {
+            let now = std::time::Instant::now();
+            BIND_STATS[part].fetch_add((now - sample.last).as_nanos() as u64, Ordering::Relaxed);
+            sample.last = now;
+        }
+    }
+}
+
+pub(crate) fn bind_line(frames: f64) {
+    let counts = BIND_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let samples = BIND_SAMPLE.swap(0, Ordering::Relaxed);
+    let ms = |i: usize| counts[i] as f64 * 64.0 / frames / 1e6;
+    tracing::info!("bind per frame (sampled estimates): {:.0} thread-local signature hits, {} sampled binds; heaps/pipeline {:.2} ms, tables {:.2} ms, address memory {:.2} ms, constants {:.2} ms, SRV/CBV {:.2} ms, UAV {:.2} ms",
+        counts[0] as f64 / frames, samples, ms(1), ms(2), ms(3), ms(4), ms(5), ms(6));
+}
+
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
@@ -392,13 +426,14 @@ static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shad
 
 /// [`ARGUMENT_COPIES`] that live, and `first` put in front of them.
 fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
-    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
-    let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
-    *copies = std::iter::once(first)
-        .chain(&live)
-        .take(crate::indirect::batch::SOURCES)
-        .map(std::sync::Arc::downgrade)
-        .collect();
+    let live = {
+        let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+        let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
+        copies.clear();
+        copies.extend(std::iter::once(first).chain(&live).take(crate::indirect::batch::SOURCES).map(std::sync::Arc::downgrade));
+        live
+    };
+    // Driver AddRefs and final Arc drops are outside the global lock.
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
@@ -1501,6 +1536,10 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        self.prepare_pipeline(list, p, indexed, mesh)
+    }
+
+    fn prepare_pipeline(&mut self, list: &HostList, p: &HostPipeline, indexed: bool, mesh: bool) -> bool {
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
@@ -1590,6 +1629,7 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let mut profile = BindSample::start();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1674,6 +1714,7 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        BindSample::part(&mut profile, 1);
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1682,6 +1723,7 @@ impl State {
             }
             let made = self.tables(list, &t.tables, compute);
             STORES.set(true);
+            BindSample::part(&mut profile, 2);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1711,6 +1753,7 @@ impl State {
             } else {
                 None
             };
+            BindSample::part(&mut profile, 3);
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1722,18 +1765,23 @@ impl State {
                         &mut more
                     }
                 };
+                let mut offsets = [None; 256];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                    values[u.index as usize] = if u.root == RootType::Table {
+                        let cached = &mut offsets[usize::from(u.slot)];
+                        *cached.get_or_insert_with(|| {
+                            made.iter().find(|m| m.0 == u.slot).map_or_else(
+                                || self.user_value(compute, u.slot, u.root, u.dword),
+                                |m| m.1,
+                            )
+                        })
+                    } else {
+                        self.user_value(compute, u.slot, u.root, u.dword)
                     };
                 }
                 #[cfg(feature = "diagnostics")]
@@ -1750,6 +1798,7 @@ impl State {
                     }
                 }
             }
+            BindSample::part(&mut profile, 4);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1847,6 +1896,7 @@ impl State {
                     }
                 }
             }
+            BindSample::part(&mut profile, 5);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -1874,6 +1924,7 @@ impl State {
                     return false;
                 }
             }
+            BindSample::part(&mut profile, 6);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
@@ -1920,12 +1971,9 @@ impl State {
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
-            s.refresh(list, a, len);
-            if writes {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
-            }
+            #[cfg(feature = "diagnostics")]
+            if writes { crate::host::wide_write(a, len, self.pipeline); }
+            s.access(list, a, len, writes);
         };
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
@@ -4379,8 +4427,8 @@ impl State {
             }
         };
         let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            DRAW | INDEXED => self.prepare_pipeline(list, p, kind == INDEXED, false),
+            MESH => self.prepare_pipeline(list, p, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
@@ -4472,6 +4520,27 @@ mod thread_tests {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_SIGNATURE_LOCAL").is_none_or(|v| v != "0")) {
+        return host_signature_shared(kind, stride);
+    }
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Vec<((u32, u32), ID3D12CommandSignature)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    LOCAL.with(|local| {
+        let mut local = local.borrow_mut();
+        if let Some((_, signature)) = local.iter().find(|(k, _)| *k == (kind, stride)) {
+            BIND_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(signature.clone());
+        }
+        let signature = host_signature_shared(kind, stride)?;
+        if local.len() >= 16 { local.remove(0); }
+        local.push(((kind, stride), signature.clone()));
+        Some(signature)
+    })
+}
+
+fn host_signature_shared(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
@@ -4628,22 +4697,16 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
-        if kind == ResourceType::Uav {
-            // A shader that cannot store to buffers leaves the range as
-            // the title has it: nothing to find afterwards.
-            if STORES.get() || !write_skip() {
-                #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
-            } else {
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
-                }
-            }
+        let writes = kind == ResourceType::Uav && (STORES.get() || !write_skip());
+        #[cfg(feature = "diagnostics")]
+        if writes {
+            crate::host::wide_write(address, len, 0);
+        } else if kind == ResourceType::Uav {
+            crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+            crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
         }
+        if writes { shadow.access(list, address, len, true); }
+        else { shadow.refresh(list, address, len); }
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {

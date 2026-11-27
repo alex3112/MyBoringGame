@@ -800,6 +800,10 @@ fn dispatch_releases(done: RetiredBatch, limit: u64) {
 }
 
 fn release_line(frames: f64) {
+    crate::draw::bind_line(frames);
+    let access = ACCESS_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("recording access per frame: {:.0} combined read/write locks, {:.0} steps indexed in {:.2} ms on recording threads, {:.0} submission step inspections avoided",
+        access[0], access[1], access[2] / 1000.0, access[3]);
     let scratch = SCRATCH_RECYCLE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
     tracing::info!("scratch recycling per frame (VICTORY_SCRATCH_RECYCLE={}): {:.1} reused, {:.1} still referenced probes, {:.1} created, {:.1} quarantined; {:.0} duplicate list keeps avoided",
         u8::from(scratch_recycle()), scratch[0], scratch[1], scratch[2], scratch[3], KEEP_ONCE_STATS.swap(0, Ordering::Relaxed) as f64 / frames);
@@ -2641,6 +2645,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    submission_index: Option<SubmissionIndex>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -2748,7 +2753,72 @@ fn refresh_coverage_does_not_fill_holes() {
     assert!(c.remember(10, 50));
 }
 
+static ACCESS_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn record_refresh(deferred: &mut Deferred, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    let key = std::sync::Arc::as_ptr(shadow) as usize;
+    let Some(end) = address.checked_add(len) else { return };
+    if deferred.refreshed.entry(key).or_default().remember(address, end) {
+        deferred.copies.push(Step::Refresh(shadow.clone(), address, len));
+    } else {
+        REFRESH_REUSE[0].fetch_add(1, Ordering::Relaxed);
+        REFRESH_REUSE[1].fetch_add(len as u64, Ordering::Relaxed);
+    }
+}
+
+fn record_gpu_write(deferred: &mut Deferred, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+    if deferred.gpu_written.insert(key) || !declare_once() {
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+}
+
+// Immutable indices into the closed recording, built on its translating
+// thread. The actual recorded steps, including their order, remain intact.
+#[derive(Default)]
+struct SubmissionIndex {
+    count: usize,
+    // (first step for this copy, lowest address, highest address)
+    refresh: Vec<(usize, usize, usize)>,
+    writes: Vec<usize>,
+}
+
+fn submission_index_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SUBMIT_INDEX").is_none_or(|v| v != "0"))
+}
+
 impl Deferred {
+    fn build_submission_index(&mut self) {
+        if !submission_index_on() || self.copies.len() < 64 { return; }
+        let started = std::time::Instant::now();
+        let mut index = SubmissionIndex { count: self.copies.len(), ..Default::default() };
+        let mut by_copy: ByCopy<usize> = ByCopy::default();
+        for (i, step) in self.copies.iter().enumerate() {
+            match step {
+                Step::Refresh(shadow, from, len) => {
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    let at = *by_copy.entry(key).or_insert_with(|| {
+                        index.refresh.push((i, *from, *from + *len));
+                        index.refresh.len() - 1
+                    });
+                    let span = &mut index.refresh[at];
+                    span.1 = span.1.min(*from);
+                    span.2 = span.2.max(*from + *len);
+                }
+                Step::GpuWrite(..) => index.writes.push(i),
+                _ => {}
+            }
+        }
+        ACCESS_STATS[1].fetch_add(self.copies.len() as u64, Ordering::Relaxed);
+        ACCESS_STATS[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.submission_index = Some(index);
+    }
+
+    fn submission_index(&self) -> Option<&SubmissionIndex> {
+        self.submission_index.as_ref().filter(|index| index.count == self.copies.len())
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -3285,7 +3355,8 @@ static WIDE_WRITES: Mutex<Option<std::collections::HashMap<(usize, usize, usize)
 /// raw address (1).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn wide_write(address: u64, len: u64, pipeline: usize) {
-    if len < 1 << 20 {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if len < 1 << 20 || !*ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_WRITE_DETAIL").is_some_and(|v| v == "1")) {
         return;
     }
     let mut all = WIDE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
@@ -4272,18 +4343,23 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut places: ByCopy<usize> = ByCopy::default();
     let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
     for list in runs {
-        for step in &list.deferred().copies {
+        let deferred = list.deferred();
+        let mut add = |step: &Step| {
             if let Step::GpuWrite(shadow, address, len) = step {
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
-                if !seen.insert((key, *address, *len)) {
-                    continue;
-                }
+                if !seen.insert((key, *address, *len)) { return; }
                 let i = *places.entry(key).or_insert_with(|| {
                     back.push((shadow.clone(), Vec::new()));
                     back.len() - 1
                 });
                 back[i].1.push((*address, *address + *len));
             }
+        };
+        if let Some(index) = deferred.submission_index() {
+            ACCESS_STATS[3].fetch_add(deferred.copies.len().saturating_sub(index.writes.len()) as u64, Ordering::Relaxed);
+            for &i in &index.writes { add(&deferred.copies[i]); }
+        } else {
+            for step in &deferred.copies { add(step); }
         }
     }
     back
@@ -6128,14 +6204,26 @@ impl Host {
         if crate::watch::once() {
             let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
             for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                let deferred = list.deferred();
+                let mut add = |shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize| {
+                    // Evaluate watched state at submission, not recording.
+                    if shadow.asked_ahead() {
+                        let span = spans.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert((from, to));
+                        *span = (span.0.min(from), span.1.max(to));
+                    }
+                };
+                if let Some(index) = deferred.submission_index() {
+                    ACCESS_STATS[3].fetch_add(deferred.copies.len().saturating_sub(index.refresh.len()) as u64, Ordering::Relaxed);
+                    for &(i, from, to) in &index.refresh {
+                        if let Step::Refresh(shadow, ..) = &deferred.copies[i] {
+                            add(shadow, from, to);
+                        }
+                    }
+                } else {
+                    for step in &deferred.copies {
+                        if let Step::Refresh(shadow, address, len) = step {
+                            add(shadow, *address, *address + *len);
+                        }
                     }
                 }
             }
@@ -6825,6 +6913,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.deferred().build_submission_index();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6859,6 +6948,7 @@ impl HostList {
         let found = coming.wait();
         let mut deferred = self.deferred();
         let at = at.min(deferred.copies.len());
+        deferred.submission_index = None;
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
@@ -7458,13 +7548,23 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let Some(end) = address.checked_add(len) else { return };
-        if deferred.refreshed.entry(key).or_default().remember(address, end) {
-            deferred.copies.push(Step::Refresh(shadow.clone(), address, len));
-        } else {
-            REFRESH_REUSE[0].fetch_add(1, Ordering::Relaxed);
-            REFRESH_REUSE[1].fetch_add(len as u64, Ordering::Relaxed);
+        record_refresh(&mut deferred, shadow, address, len);
+    }
+
+    /// The same two adjacent steps as refresh followed by gpu_write,
+    /// with a single acquisition of the recording's deferred lock.
+    pub(crate) fn defer_access(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        write: bool,
+    ) {
+        let mut deferred = self.deferred();
+        record_refresh(&mut deferred, shadow, address, len);
+        if write {
+            record_gpu_write(&mut deferred, shadow, address, len);
+            ACCESS_STATS[0].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -7480,10 +7580,7 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.gpu_written.insert(key) || !declare_once() {
-            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
-        }
+        record_gpu_write(&mut deferred, shadow, address, len);
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
