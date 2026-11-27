@@ -4222,6 +4222,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod fidelityfx;
+mod frame_generation;
 pub(crate) mod settings_menu;
 mod place;
 mod send;
@@ -9397,6 +9398,7 @@ struct Presenter {
     meter: Meter,
     composer: Option<crate::compose::Composer>,
     settings: settings_menu::Menu,
+    generation: Option<frame_generation::Proxy>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9768,6 +9770,10 @@ impl Host {
         }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
+            if let Some(generation) = p.generation.as_mut()
+                && !generation.before_resize(&p.swap_chain, frame) {
+                return None;
+            }
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
@@ -9804,6 +9810,10 @@ impl Host {
                     return self.present_planes(texture, state_u32, None, frame);
                 }
             }
+        }
+        if let Some(generation) = p.generation.as_mut()
+            && !generation.begin_frame() {
+            return None;
         }
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
@@ -9944,6 +9954,16 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             p.settings.draw(self, copy, &back, p.hwnd, (width, height), format);
+            if let Some(generation) = p.generation.as_mut() {
+                generation.prepare(frame, frame_generation::Target {
+                    host: self, copy, swap: &p.swap_chain, size: [width, height], format,
+                    hudless: composed.then_some((texture, state)),
+                });
+                if generation.blocked() {
+                    copy.close();
+                    return None;
+                }
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -9989,7 +10009,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if let Some(generation) = p.generation.as_mut() {
+                generation.presented(&p.swap_chain, presented.is_ok());
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10029,9 +10052,15 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let (swap_chain, generation) = match frame_generation::Proxy::new(self, &factory, hwnd, &desc) {
+                Ok((swap, generation)) => (swap, Some(generation)),
+                Err(error) => {
+                    victory_core::fsr::set_generation_status("Unavailable - native swapchain not created");
+                    tracing::warn!(%error, "FFX FG: using original DXGI swapchain");
+                    (factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?, None)
+                }
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -10047,6 +10076,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 settings: settings_menu::Menu::new(),
+                generation,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

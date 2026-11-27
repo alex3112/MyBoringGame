@@ -51,7 +51,8 @@ const SHARP: Hit = Hit { x: 390, y: 194, w: 382, h: 37 };
 const MINUS: Hit = Hit { x: 390, y: 238, w: 55, h: 37 };
 const PLUS: Hit = Hit { x: 717, y: 238, w: 55, h: 37 };
 const RESET: Hit = Hit { x: 390, y: 282, w: 382, h: 37 };
-const PROBE: Hit = Hit { x: 390, y: 367, w: 382, h: 37 };
+const FG: Hit = Hit { x: 390, y: 344, w: 382, h: 29 };
+const PROBE: Hit = Hit { x: 390, y: 377, w: 382, h: 31 };
 const CLOSE: Hit = Hit { x: 558, y: 477, w: 214, h: 40 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -261,15 +262,17 @@ pub(super) struct Menu {
     picture: Option<Picture>,
     fsr_status: Option<Status>,
     strength: u8,
+    fg_status: String,
 }
 impl Menu {
     pub(super) fn new() -> Self {
         OPEN.store(false, Ordering::Release);
         fsr::register_observer(observe_resources);
+        fsr::register_temporal(super::frame_generation::capture);
         Self {
             down: false, mouse_down: false, escape_down: false,
             status: "FSR sharpening controls the title's original upscaler. No second upscaler.".into(),
-            revision: 0, probe: None, picture: None, fsr_status: None, strength: 30,
+            revision: 0, probe: None, picture: None, fsr_status: None, strength: 30, fg_status: fsr::generation_status(),
         }
     }
 
@@ -312,6 +315,10 @@ impl Menu {
                 fsr::set_request(Sharpening::On(self.strength));
                 self.status("Sharpness change requested; waiting for the next FSR dispatch.".into());
             }
+            8 if !self.fg_status.starts_with("Unavailable") => {
+                fsr::request_generation(!fsr::generation_requested());
+                self.revision = self.revision.wrapping_add(1);
+            }
             7 if self.fsr_status.is_some() => {
                 fsr::set_request(Sharpening::Game);
                 self.status("Restoring the title's original sharpening parameters.".into());
@@ -345,7 +352,7 @@ impl Menu {
         let mut c = Canvas::new(layout)?;
         c.rect(Hit { x: 0, y: 0, w: W, h: H }, BG);
         c.rect(Hit { x: 16, y: 55, w: 768, h: 39 }, BLUE);
-        for (id, rect) in [(1, PROBE), (3, CLOSE), (4, SHARP), (5, MINUS), (6, PLUS), (7, RESET)] {
+        for (id, rect) in [(1, PROBE), (3, CLOSE), (4, SHARP), (5, MINUS), (6, PLUS), (7, RESET), (8, FG)] {
             c.rect(rect, if hover == id { HOVER } else if id == 3 { BLUE } else { BUTTON });
         }
         c.rect(Hit { x: 450, y: 238, w: 262, h: 37 }, BUTTON);
@@ -377,13 +384,15 @@ impl Menu {
         c.text(28, 290, "Restore title defaults", 20, false, TEXT);
         c.text(411, 290, "Reset sharpening", 19, true, TEXT);
         c.text(28, 329, "AMD Frame Generation", 17, true, ACCENT);
-        c.text(28, 351, "Frame Generation", 20, false, TEXT);
-        c.text(400, 351, "Off - native dispatch not integrated", 17, false, MUTED);
-        c.text(28, 377, "FidelityFX SDK", 20, false, TEXT);
-        c.text(411, 377, "Check SDK", 19, true, TEXT);
+        c.text(28, 348, "Frame Generation", 20, false, TEXT);
+        let fg_label = if self.fg_status.starts_with("Unavailable") { "Unavailable" } else if fsr::generation_requested() { "On (experimental)" } else { "Off" };
+        c.text(411, 348, fg_label, 18, true, TEXT);
+        c.text(28, 383, "FidelityFX SDK", 20, false, TEXT);
+        c.text(411, 383, "Check SDK", 19, true, TEXT);
         // Keep arbitrary loader error messages inside the panel.
         let mut lines = vec![String::new()];
-        for word in self.status.split_whitespace() {
+        let status_text = format!("FG: {} | {}", self.fg_status, self.status);
+        for word in status_text.split_whitespace() {
             if lines.last().is_some_and(|s| s.chars().count() + word.chars().count() > 84) && lines.len() < 3 {
                 lines.push(String::new());
             }
@@ -443,6 +452,11 @@ impl Menu {
             return;
         }
         self.poll_probe();
+        let fg = fsr::generation_status();
+        if fg != self.fg_status {
+            self.fg_status = fg;
+            self.revision = self.revision.wrapping_add(1);
+        }
         let current = fsr::status();
         if self.fsr_status != current {
             self.fsr_status = current;
@@ -464,6 +478,7 @@ impl Menu {
             else if self.fsr_status.is_some() && MINUS.contains(p) { 5 }
             else if self.fsr_status.is_some() && PLUS.contains(p) { 6 }
             else if self.fsr_status.is_some() && RESET.contains(p) { 7 }
+            else if !self.fg_status.starts_with("Unavailable") && FG.contains(p) { 8 }
             else { 0 }
         });
         if clicked { self.action(hover); }

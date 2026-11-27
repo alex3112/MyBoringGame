@@ -71,3 +71,41 @@ mod tests {
         assert_eq!(Sharpening::decode(u32::MAX), Sharpening::On(100));
     }
 }
+
+
+/// Captured only while interpolation is requested. The observer runs
+/// synchronously while the title owns the resource objects.
+#[derive(Clone, Copy, Debug)]
+pub struct Temporal {
+    pub depth: usize,
+    pub motion: usize,
+    pub render: [u32; 2],
+    pub output: [u32; 2],
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub dt_ms: f32,
+    pub near: f32,
+    pub far: f32,
+    pub fov: f32,
+    pub meters: f32,
+    pub reset: bool,
+    pub upscale_flags: u32,
+}
+static FG_REQUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEMPORAL: OnceLock<fn(Temporal)> = OnceLock::new();
+pub fn generation_requested() -> bool { FG_REQUEST.load(Ordering::Acquire) }
+pub fn request_generation(enabled: bool) { FG_REQUEST.store(enabled, Ordering::Release); }
+pub fn register_temporal(observer: fn(Temporal)) { let _ = TEMPORAL.set(observer); }
+pub fn observe_temporal(value: Temporal) {
+    if generation_requested() && let Some(observer) = TEMPORAL.get() { observer(value); }
+}
+static FG_STATUS: Mutex<String> = Mutex::new(String::new());
+pub fn generation_status() -> String {
+    FG_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+pub fn set_generation_status(status: &str) {
+    let mut current = FG_STATUS.lock().unwrap_or_else(|e| e.into_inner());
+    if current.as_str() != status {
+        *current = status.to_owned();
+    }
+}

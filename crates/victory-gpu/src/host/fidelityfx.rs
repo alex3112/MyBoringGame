@@ -15,9 +15,9 @@ type Ptr = *mut c_void;
 type Result<T> = std::result::Result<T, String>;
 
 #[repr(C)]
-struct Header {
-    kind: u64,
-    next: *mut Header,
+pub(super) struct Header {
+    pub(super) kind: u64,
+    pub(super) next: *mut Header,
 }
 
 #[repr(C)]
@@ -34,10 +34,13 @@ const GET_VERSIONS: u64 = 4;
 const CREATE_FRAME_GENERATION: u64 = 0x0002_0001;
 type Query = unsafe extern "C" fn(*mut Ptr, *mut Header) -> u32;
 
-struct Library(HMODULE);
+pub(super) struct Library(HMODULE);
+// A loaded module handle is process-wide. The owner keeps it alive until all
+// its contexts and callbacks have been destroyed.
+unsafe impl Send for Library {}
 
 impl Library {
-    fn open() -> Result<Self> {
+    pub(super) fn open() -> Result<Self> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         // SDK 2.x has a loader and separate effect DLLs; SDK 1.1.x
         // exposes the same public API through the monolithic DX12 library.
@@ -76,6 +79,12 @@ impl Library {
         } else {
             Err(errors.join("; "))
         }
+    }
+}
+
+impl Library {
+    pub(super) fn symbol(&self, name: &CStr) -> Result<unsafe extern "system" fn() -> isize> {
+        unsafe { GetProcAddress(self.0, name.as_ptr().cast()) }.ok_or_else(|| format!("FidelityFX export missing: {}", name.to_string_lossy()))
     }
 }
 

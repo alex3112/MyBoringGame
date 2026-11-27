@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 use victory_core::fsr::{self, Sharpening, Status};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -29,6 +29,7 @@ static CALLS: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] };
 static ERRORS: [[AtomicU64; 5]; 3] = [const { [const { AtomicU64::new(0) }; 5] }; 3];
 static ENABLED: OnceLock<bool> = OnceLock::new();
 static CONTROLS: OnceLock<bool> = OnceLock::new();
+static UPSCALE_FLAGS: AtomicU32 = AtomicU32::new(u32::MAX);
 
 pub fn is_module(file: &str) -> bool {
     MODULES.iter().any(|m| m.eq_ignore_ascii_case(file))
@@ -210,6 +211,9 @@ unsafe extern "C" fn create<const M: usize>(context: *mut c_void, desc: *mut c_v
     let rc = unsafe { f(context, desc, alloc) };
     let last_error = unsafe { GetLastError() };
     after::<M>(CREATE, n, kind, context, rc);
+    if M == 0 && rc == 0 && let Some(b) = read::<36>(desc as usize) && u64_at(&b, 0) == 0x0001_0000 {
+        UPSCALE_FLAGS.store(u32_at(&b, 16), Ordering::Release);
+    }
     unsafe { SetLastError(last_error) };
     rc
 }
@@ -221,7 +225,7 @@ unsafe extern "C" fn destroy<const M: usize>(context: *mut c_void, alloc: *const
     let rc = unsafe { f(context, alloc) };
     let last_error = unsafe { GetLastError() };
     after::<M>(DESTROY, n, kind, context, rc);
-    if M == 0 && rc == 0 { fsr::clear(); }
+    if M == 0 && rc == 0 { fsr::clear(); UPSCALE_FLAGS.store(u32::MAX, Ordering::Release); }
     unsafe { SetLastError(last_error) };
     rc
 }
@@ -328,6 +332,16 @@ unsafe extern "C" fn dispatch<const M: usize>(context: *mut c_void, desc: *const
             tracing::info!(?state, "FFX runtime: title sharpening dispatch");
         }
         fsr::publish(state);
+        if rc == 0 && fsr::generation_requested() {
+            fsr::observe_temporal(fsr::Temporal {
+                depth: u64_at(&b.0, 72) as usize, motion: u64_at(&b.0, 120) as usize,
+                render: state.render, output: state.upscale, jitter: floats(&b.0, 360),
+                motion_scale: floats(&b.0, 368), dt_ms: f32_at(&b.0, 400),
+                near: f32_at(&b.0, 412), far: f32_at(&b.0, 416), fov: f32_at(&b.0, 420),
+                meters: f32_at(&b.0, 424), reset: b.0[408] != 0,
+                upscale_flags: UPSCALE_FLAGS.load(Ordering::Acquire),
+            });
+        }
         let n = CALLS[M][DISPATCH].load(Ordering::Relaxed);
         if rc == 0 && audit_enabled() && sample(n) {
             let ids = [0, 1, 2, 6];
