@@ -520,6 +520,77 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+// One retired owner per resource identity, at the *latest* fence of
+// all the slots that handed it back. Keeping one Arc alive is sufficient
+// for COM lifetime; never advance the original retirement deadline.
+struct SharedRetire<T> {
+    pending: std::collections::HashMap<usize, (u64, std::sync::Arc<T>)>,
+    earliest: u64,
+}
+
+impl<T> SharedRetire<T> {
+    fn new() -> Self {
+        Self { pending: Default::default(), earliest: u64::MAX }
+    }
+
+    fn add(&mut self, fence: u64, owner: std::sync::Arc<T>) -> bool {
+        let key = std::sync::Arc::as_ptr(&owner) as usize;
+        self.earliest = self.earliest.min(fence);
+        match self.pending.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (at, _) = entry.get_mut();
+                *at = (*at).max(fence);
+                true
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((fence, owner));
+                false
+            }
+        }
+    }
+
+    fn take(&mut self, finished: u64) -> Vec<(u64, std::sync::Arc<T>)> {
+        if self.earliest > finished { return Vec::new(); }
+        let mut keys = Vec::new();
+        let mut earliest = u64::MAX;
+        for (&key, (fence, _)) in &self.pending {
+            if *fence <= finished { keys.push(key); }
+            else { earliest = earliest.min(*fence); }
+        }
+        self.earliest = earliest;
+        keys.into_iter().filter_map(|key| self.pending.remove(&key)).collect()
+    }
+}
+
+static SHARED_RETIRED: OnceLock<Mutex<SharedRetire<SlotResource>>> = OnceLock::new();
+static SHARED_RETIRE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn coalesce_retirements() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHARED_RETIRE_COALESCE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+#[test]
+fn shared_retirement_waits_for_latest_fence_even_out_of_order() {
+    let owner = std::sync::Arc::new(7);
+    let another = std::sync::Arc::new(9);
+    let mut pending = SharedRetire::new();
+    assert!(!pending.add(10, owner.clone()));
+    assert!(pending.add(30, owner.clone()));
+    assert!(pending.add(20, owner.clone()));
+    assert!(!pending.add(12, another.clone()));
+    assert!(pending.take(10).is_empty());
+    let done = pending.take(12);
+    assert_eq!(done.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&done[0].1, &another));
+    assert!(pending.take(29).is_empty());
+    let done = pending.take(30);
+    assert_eq!(done.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&done[0].1, &owner));
+    assert!(pending.take(100).is_empty());
+}
+
 /// Same eligibility rule as retire_resource, with a shared Rust owner.
 pub(crate) fn retire_slot_resource(object: std::sync::Arc<SlotResource>) {
     let queued = crate::queue::queued();
@@ -530,7 +601,14 @@ pub(crate) fn retire_slot_resource(object: std::sync::Arc<SlotResource>) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::SharedResource(object)));
+    if coalesce_retirements() {
+        let mut pending = SHARED_RETIRED.get_or_init(|| Mutex::new(SharedRetire::new()))
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let reused = pending.add(started, object);
+        SHARED_RETIRE_STATS[usize::from(reused)].fetch_add(1, Ordering::Relaxed);
+    } else {
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::SharedResource(object)));
+    }
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -554,7 +632,14 @@ fn take_retired(finished: u64) -> Vec<(u64, Retired)> {
     let finished = finished.saturating_sub(bury_lag());
     let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
     let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-    retired.drain(..n).collect()
+    let mut done: Vec<_> = retired.drain(..n).collect();
+    drop(retired);
+    if let Some(pending) = SHARED_RETIRED.get() {
+        let owners = pending.lock().unwrap_or_else(|e| e.into_inner()).take(finished);
+        SHARED_RETIRE_STATS[2].fetch_add(owners.len() as u64, Ordering::Relaxed);
+        done.extend(owners.into_iter().map(|(fence, owner)| (fence, Retired::SharedResource(owner))));
+    }
+    done
 }
 
 fn bury(finished: u64) {
@@ -657,6 +742,9 @@ fn dispatch_releases(done: RetiredBatch, limit: u64) {
 }
 
 fn release_line(frames: f64) {
+    let owners = SHARED_RETIRE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("shared resource retirement per frame (VICTORY_SHARED_RETIRE_COALESCE={}): {:.0} distinct queued owners, {:.0} redundant retirements coalesced, {:.0} owners released",
+        u8::from(coalesce_retirements()), owners[0], owners[1], owners[2]);
     let s = RELEASE_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
     tracing::info!(batched = release_batched(),
         "relay release per frame (VICTORY_RELAY_RELEASE_ASYNC={}): {:.2} ms collecting eligible objects, {:.0} queued, {:.2} ms synchronous drops ({} objects), {:.2} ms worker drops ({:.0} objects), {} outstanding; diagnostics {:.2} ms, final line update {:.2} ms",

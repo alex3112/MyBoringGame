@@ -555,6 +555,11 @@ fn window_mapped_most() -> u64 {
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 // Cumulative admission failures: budget/pressure, window cap, driver allocation.
 static WINDOW_ADMISSION: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static WINDOW_REFUSAL_DETAIL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn local_window_refusal_detail() -> [u64; 4] {
+    WINDOW_REFUSAL_DETAIL.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
 
 pub(crate) fn local_window_refusals() -> [u64; 3] {
     WINDOW_ADMISSION.each_ref().map(|n| n.load(Ordering::Relaxed))
@@ -575,8 +580,9 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     let _admission = crate::residency::local_shadow_lock();
-    if !crate::residency::local_shadow_room(host.video_memory(), size.saturating_add(window_reserve()), 80, true) {
+    if let Some(reason) = crate::residency::window_admission(host.video_memory(), size, window_reserve()) {
         WINDOW_ADMISSION[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_REFUSAL_DETAIL[reason].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if crate::residency::adaptive_vram() && window_card_most() != 0
@@ -618,8 +624,9 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     let _admission = crate::residency::local_shadow_lock();
-    if !crate::residency::local_shadow_room(host.video_memory(), size.saturating_add(window_reserve()), 80, true) {
+    if let Some(reason) = crate::residency::window_admission(host.video_memory(), size, window_reserve()) {
         WINDOW_ADMISSION[0].fetch_add(1, Ordering::Relaxed);
+        WINDOW_REFUSAL_DETAIL[reason].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let occupied = if crate::residency::adaptive_vram() {
@@ -5572,6 +5579,11 @@ fn containing_window(
     }).min_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
+fn read_window_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_READ_REUSE").is_none_or(|v| v != "0"))
+}
+
 fn reused_window(shadow: &Shadow, named: WindowKey) {
     WINDOW_REUSE[0].fetch_add(1, Ordering::Relaxed);
     WINDOW_REUSE[1].fetch_add(named.1.min(shadow.len), Ordering::Relaxed);
@@ -5618,6 +5630,20 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         {
             note(shadow);
             return Some(shadow.clone());
+        }
+        // Transient sized requests never install aliases. Their existing
+        // containing allocation can be found with the shared map lock;
+        // the descriptor's stable alias above always takes precedence.
+        if read_window_reuse() && any && !unsized_ask && !tails() {
+            let wanted = (address, end - address);
+            let key = if map.contains_key(&named) { Some(named) } else {
+                containing_window(map.range(..=(address, u64::MAX)).map(|(key, _)| *key), wanted, false)
+            };
+            if let Some(key) = key && let Some(shadow) = map.get(&key) {
+                if key != named { reused_window(shadow, named); }
+                note(shadow);
+                return Some(shadow.clone());
+            }
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());

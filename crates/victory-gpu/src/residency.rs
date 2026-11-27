@@ -143,6 +143,42 @@ pub(crate) fn local_shadow_room(memory: Option<[u64; 4]>, size: u64, legacy_perc
     local_room_at(memory, size, percent, adaptive_vram() && optional)
 }
 
+fn window_adaptive() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_ADMISSION_V2").is_none_or(|v| v != "0"))
+}
+
+// The target already leaves a percentage of the budget unused. Do not
+// reserve it twice: require both the target ceiling and sufficient space
+// for known mandatory allocations plus an independent emergency margin.
+// The old pressure and commit tests still apply.
+fn window_limit(budget: u64, reserve: u64, percent: u64) -> u64 {
+    (budget / 100 * percent).min(budget.saturating_sub(reserve.saturating_add(256 * MIB)))
+}
+
+/// Rejection index: 0 target, 1 critical host memory, 2 mandatory reserve,
+/// 3 unknown DXGI budget. None is admitted.
+pub(crate) fn window_admission(memory: Option<[u64; 4]>, size: u64, reserve: u64) -> Option<usize> {
+    if !adaptive_vram() || !window_adaptive() {
+        return (!local_shadow_room(memory, size.saturating_add(reserve), 80, true)).then_some(0);
+    }
+    if critical_memory() { return Some(1); }
+    let Some([budget, used, ..]) = memory.filter(|m| m[0] != 0) else { return Some(3); };
+    let requested = used.saturating_add(size);
+    let percent = local_target_percent();
+    if requested > budget / 100 * percent { return Some(0); }
+    if requested > window_limit(budget, reserve, percent) { return Some(2); }
+    None
+}
+
+#[cfg(test)]
+#[test]
+fn window_budget_keeps_mandatory_reserve_without_double_counting_headroom() {
+    assert_eq!(window_limit(10000 * MIB, 512 * MIB, 92), 9200 * MIB);
+    assert_eq!(window_limit(10000 * MIB, 1500 * MIB, 92), 8244 * MIB);
+    assert_eq!(window_limit(128 * MIB, 512 * MIB, 92), 0);
+}
+
 fn local_room_at(memory: Option<[u64; 4]>, size: u64, percent: u64, require_budget: bool) -> bool {
     match memory {
         Some([budget, used, ..]) if budget != 0 => used.saturating_add(size) <= budget / 100 * percent,
@@ -211,6 +247,9 @@ pub(crate) fn refresh() {
             local_shadow_windows_mib = crate::shadow::local_copy_bytes()[1] >> 20,
             local_mapped_windows_mib = crate::shadow::local_copy_bytes()[2] >> 20,
             window_admission_refusals = ?crate::shadow::local_window_refusals(),
+            window_refusal_detail = ?crate::shadow::local_window_refusal_detail(),
+            reserved_render_targets_mib = crate::resource::targets_room_kept() >> 20,
+            reserved_card_buffers_mib = crate::shadow::card_room_kept() >> 20,
             vram_target_percent = local_target_percent(),
             texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
             spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
@@ -232,6 +271,9 @@ pub(crate) fn refresh() {
             local_shadow_windows_mib = crate::shadow::local_copy_bytes()[1] >> 20,
             local_mapped_windows_mib = crate::shadow::local_copy_bytes()[2] >> 20,
             window_admission_refusals = ?crate::shadow::local_window_refusals(),
+            window_refusal_detail = ?crate::shadow::local_window_refusal_detail(),
+            reserved_render_targets_mib = crate::resource::targets_room_kept() >> 20,
+            reserved_card_buffers_mib = crate::shadow::card_room_kept() >> 20,
             vram_target_percent = local_target_percent(),
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,

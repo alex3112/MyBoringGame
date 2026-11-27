@@ -631,7 +631,7 @@ fn heap_spread() -> bool {
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
 #[derive(Default)]
-struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>, Vec<u64>);
 
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
@@ -643,7 +643,7 @@ pub(crate) struct BufferSweep {
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, ranges: HeapRanges(Vec::new(), Vec::new()), unwatched: Default::default() }
     }
 }
 
@@ -656,17 +656,53 @@ impl<T> HeapRanges<T> {
         if slot >= self.0.len() {
             self.0.resize_with(slot + 1, || None);
         }
+        if self.1.len() <= slot / 64 {
+            self.1.resize(slot / 64 + 1, 0);
+        }
+        let mask = 1u64 << (slot % 64);
+        if range.is_some() { self.1[slot / 64] |= mask; }
+        else { self.1[slot / 64] &= !mask; }
         self.0[slot] = range;
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+        self.1.clear();
     }
 
     /// Forgets the slots of one of `parts` parts
     /// (`HostHeap::buffer_slots_of`).
     fn forget_part(&mut self, part: u32, parts: u32) {
-        self.0.iter_mut().skip(part as usize).step_by(parts as usize).for_each(|r| *r = None);
+        if crate::descriptor::host::fast_buffer_slots() && parts != 0 && parts <= 64 && 64 % parts == 0 {
+            let mask = (part..64).step_by(parts as usize).fold(0u64, |bits, i| bits | (1u64 << i));
+            for (n, word) in self.1.iter_mut().enumerate() {
+                let mut selected = *word & mask;
+                *word &= !mask;
+                while selected != 0 {
+                    let bit = selected.trailing_zeros() as usize;
+                    selected &= selected - 1;
+                    self.0[n * 64 + bit] = None;
+                }
+            }
+        } else {
+            for slot in (part as usize..self.0.len()).step_by(parts as usize) {
+                self.0[slot] = None;
+                self.1[slot / 64] &= !(1u64 << (slot % 64));
+            }
+        }
     }
 
     fn ranges(&self) -> impl Iterator<Item = &(T, u64, u64)> {
-        self.0.iter().flatten()
+        let sparse = crate::descriptor::host::fast_buffer_slots();
+        self.1.iter().enumerate().flat_map(move |(n, &word)| {
+            let mut bits = if sparse { word } else { u64::MAX };
+            std::iter::from_fn(move || {
+                if bits == 0 { return None; }
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(n * 64 + bit)
+            })
+        }).filter_map(move |slot| self.0.get(slot).and_then(Option::as_ref))
     }
 }
 
@@ -679,7 +715,7 @@ mod heap_range_tests {
     #[test]
     fn every_slot_is_looked_at_again_in_a_round() {
         const SLOTS: u32 = 1000;
-        let mut ranges = HeapRanges(Vec::new());
+        let mut ranges = HeapRanges(Vec::new(), Vec::new());
         ranges.set(7, None);
         assert_eq!(ranges.ranges().count(), 0);
         for slot in (0..SLOTS).step_by(3) {
@@ -709,7 +745,7 @@ mod heap_range_tests {
         use std::collections::HashMap;
         use std::sync::Arc;
         let copies: Vec<Arc<u64>> = (0..4400).map(Arc::new).collect();
-        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new()));
+        let (mut table, mut slots) = (HashMap::new(), HeapRanges(Vec::new(), Vec::new()));
         for slot in 0..72_000u32 {
             let copy = &copies[slot as usize * 7919 % 4400];
             table.insert(slot, (copy.clone(), u64::from(slot), u64::from(slot) + 64));
@@ -891,7 +927,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        ranges.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
@@ -899,6 +935,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
+        if crate::descriptor::host::fast_buffer_slots() {
+            slots.sort_unstable();
+            slots.dedup();
+        }
         slots
     } else {
         changed

@@ -127,6 +127,69 @@ pub(crate) static JOURNAL_REUSE: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 // Clean block shortcuts, bytes covered, ahead passes skipped, ranges skipped.
 
+fn indexed_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_INDEXED_RANGES").is_none_or(|v| v != "0"))
+}
+
+// Only successful kernel queries enter this index. A gap (including a
+// failed query) is never treated as covered.
+fn normalize_ahead(ranges: &mut Vec<(usize, usize)>) {
+    if !indexed_ranges() { return; }
+    ranges.sort_unstable();
+    let mut n = 0;
+    for i in 0..ranges.len() {
+        let (a, b) = ranges[i];
+        if a >= b { continue; }
+        if n != 0 && a <= ranges[n - 1].1 {
+            ranges[n - 1].1 = ranges[n - 1].1.max(b);
+        } else {
+            ranges[n] = (a, b);
+            n += 1;
+        }
+    }
+    ranges.truncate(n);
+}
+
+fn insert_ahead(ranges: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last { return; }
+    let start = ranges.partition_point(|&(_, b)| b < first);
+    let mut end = start;
+    let (mut lo, mut hi) = (first, last);
+    while end < ranges.len() && ranges[end].0 <= hi {
+        lo = lo.min(ranges[end].0);
+        hi = hi.max(ranges[end].1);
+        end += 1;
+    }
+    ranges.splice(start..end, [(lo, hi)]);
+}
+
+fn ahead_covers(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    if !indexed_ranges() {
+        return ranges.iter().any(|&(a, b)| a <= first && last <= b);
+    }
+    let at = ranges.partition_point(|&(a, _)| a <= first);
+    at != 0 && ranges[at - 1].1 >= last
+}
+
+#[cfg(test)]
+#[test]
+fn ahead_index_never_covers_a_hole() {
+    if !indexed_ranges() { return; }
+    let mut r = vec![(12, 16), (0, 4), (3, 8), (16, 20)];
+    normalize_ahead(&mut r);
+    assert_eq!(r, vec![(0, 8), (12, 20)]);
+    assert!(ahead_covers(&r, 1, 8));
+    assert!(ahead_covers(&r, 12, 20));
+    assert!(!ahead_covers(&r, 7, 13));
+    assert!(!ahead_covers(&r, 8, 9));
+    insert_ahead(&mut r, 9, 12);
+    assert_eq!(r, vec![(0, 8), (9, 20)]);
+    assert!(!ahead_covers(&r, 7, 10));
+    insert_ahead(&mut r, 8, 9);
+    assert_eq!(r, vec![(0, 20)]);
+}
+
 struct Journal {
     latest: BTreeMap<usize, u64>,
     /// Page number → the asking that last found it written.
@@ -368,6 +431,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
+    normalize_ahead(&mut asked);
     j.ahead = asked;
     let now = j.ahead_asked;
     for (page, parts) in written {
@@ -569,16 +633,34 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) {
-            continue;
+    if indexed_ranges() {
+        // Large containing requests first when their starts coincide.
+        // Query success alone extends the index: never combine requests
+        // into an unverified range spanning a reservation or hole.
+        let mut requests: Vec<_> = ranges.iter().copied().filter(|&(a,b)| a < b).collect();
+        requests.sort_unstable_by_key(|&(a,b)| (a / PAGE, std::cmp::Reverse(b)));
+        for (start, end) in requests {
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if ahead_covers(&ahead, first, last) || published(start, end) {
+                continue;
+            }
+            if let Some(pages) = kernel_written(first, last) {
+                written.extend(pages);
+                insert_ahead(&mut ahead, first, last);
+            }
         }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.push((first, last));
+    } else {
+        for &(start, end) in ranges {
+            if start >= end || published(start, end) {
+                continue;
+            }
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && let Some(pages) = kernel_written(first, last)
+            {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
         }
     }
     note_hot(&written);
@@ -593,6 +675,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         j.note(page, parts, now);
     }
     j.kept = !ahead.is_empty();
+    normalize_ahead(&mut ahead);
     j.ahead = ahead;
 }
 
@@ -666,9 +749,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_covers(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -681,7 +762,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_covers(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -765,7 +846,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_covers(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -786,9 +867,17 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         let block = page / JOURNAL_BLOCK;
         let end = last.min((block + 1) * JOURNAL_BLOCK);
         let stamps = &taken[page - first..end - first];
-        let floor = stamps.iter().copied().min().unwrap_or(0).max(ranged);
+        // A whole-range stamp is already a lower bound for every page.
+        // Do not scan 64 individual stamps if the block's newest write
+        // is known to predate that bound.
+        let latest = j.latest.get(&block).copied().unwrap_or(0);
+        let floor = if indexed_ranges() && ranged != 0 && latest <= ranged {
+            ranged
+        } else {
+            stamps.iter().copied().min().unwrap_or(0).max(ranged)
+        };
         if floor == 0 { return false; }
-        if j.latest.get(&block).copied().unwrap_or(0) <= floor {
+        if latest <= floor {
             skipped += 1;
             bytes += ((end - page) * PAGE) as u64;
         } else if !j.written.range(page..end).all(|(&p, &write)| write <= taken[p - first].max(ranged)) {
@@ -1283,6 +1372,15 @@ impl Blocks {
         self.word(block / 64) >> (block % 64) & 1 != 0
     }
 
+    fn covers(&self, first: usize, last: usize) -> bool {
+        if first >= last { return true; }
+        if !indexed_ranges() { return self.range(first..last).count() == last - first; }
+        (first / 64..last.div_ceil(64)).all(|word| {
+            let mask = in_word(word * 64, first, last);
+            self.word(word) & mask == mask
+        })
+    }
+
     /// Whether it was not there.
     fn insert(&mut self, block: usize) -> bool {
         let piece = self.0.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
@@ -1704,7 +1802,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+        if g.clean.covers(first, last) && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);

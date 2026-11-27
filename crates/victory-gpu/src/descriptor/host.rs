@@ -25,6 +25,12 @@ impl Slots {
         Slots(bits)
     }
 
+    fn contains(&self, slot: u32) -> bool {
+        self.0.get(slot as usize / 64).is_some_and(|bits| {
+            bits.load(std::sync::atomic::Ordering::Acquire) & (1u64 << (slot % 64)) != 0
+        })
+    }
+
     fn put(&self, slot: u32) {
         if let Some(bits) = self.0.get(slot as usize / 64) {
             bits.fetch_or(1 << (slot % 64), std::sync::atomic::Ordering::AcqRel);
@@ -55,6 +61,20 @@ impl Slots {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
             Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out, &which);
+        }
+        out
+    }
+
+    /// A periodic shard of the set. HEAP_ROUND divides 64, so masking
+    /// words first avoids decoding slots that belong to other shards.
+    fn part(&self, part: u32, parts: u32) -> Vec<u32> {
+        if !fast_buffer_slots() || parts == 0 || parts > 64 || 64 % parts != 0 {
+            return self.all(|slot| parts != 0 && slot % parts == part);
+        }
+        let mask = (part..64).step_by(parts as usize).fold(0u64, |bits, i| bits | (1u64 << i));
+        let mut out = Vec::new();
+        for (n, bits) in self.0.iter().enumerate() {
+            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire) & mask, &mut out, &|_| true);
         }
         out
     }
@@ -146,6 +166,10 @@ pub(crate) struct HostHeap {
     /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
     /// by the frame they were found in.
     waiting: Mutex<CopiedWaiting>,
+    // Monotonic, conservative: a slot that ever represented a texture
+    // stays on the full path, even if it is now a buffer. No stale texture
+    // queue/placed-span state is skipped.
+    texture_history: Slots,
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
@@ -908,6 +932,13 @@ const COPIED_FRAMES: u32 = 8;
 /// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
 const COPIED_GRACE: u64 = 4;
 
+pub(crate) fn fast_buffer_slots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BUFFER_FAST").is_none_or(|v| v != "0"))
+}
+
+static BUFFER_FAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn indexed_copied_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WAIT_INDEXED").is_none_or(|v| v != "0"))
@@ -1031,6 +1062,8 @@ fn intern_slot_resource(resource: &ID3D12Resource) -> std::sync::Arc<crate::host
 
 pub(super) fn lifetime_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    tracing::info!("buffer-only descriptor fast path (VICTORY_HEAP_BUFFER_FAST={}): {:.0} updates per frame without texture locks",
+        u8::from(fast_buffer_slots()), BUFFER_FAST.swap(0, Relaxed) as f64 / frames);
     let waits = WAIT_DETAIL.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     let refs = DYNAMIC_REF_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     tracing::info!(
@@ -1773,6 +1806,7 @@ impl HostHeap {
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
+            texture_history: Slots::new(count as usize),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             dynamic_kept: (0..if share_dynamic_resources() { extra } else { 0 }).map(|_| Mutex::new(None)).collect(),
@@ -2795,6 +2829,7 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if texture { self.texture_history.put(index); }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -2831,7 +2866,7 @@ impl HostHeap {
     /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
     /// slot is in the same part each time.
     pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+        self.buffers.part(part, parts)
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -2869,6 +2904,14 @@ impl HostHeap {
             }
             _ => false,
         };
+        // Non-texture slots that have never been textures have no queue
+        // or placed-span entry to remove. Still update the buffer/stride
+        // tracking, including the changed bit, as on the original path.
+        if fast_buffer_slots() && index < self.count && !texture && !self.texture_history.contains(index) {
+            self.note_buffer_stride(index, view);
+            BUFFER_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Vec::new();
+        }
         self.queue_texture(index, texture, seen, crate::frame::current());
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
@@ -2917,6 +2960,11 @@ impl HostHeap {
                 textures.remove(slot);
             }
         }
+        self.note_buffer_stride(index, view);
+        stale
+    }
+
+    fn note_buffer_stride(&self, index: u32, view: Option<&View>) {
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
         self.write_stride(index, stride.unwrap_or(0) | kind);
         let was = if stride.is_some() {
@@ -2928,7 +2976,6 @@ impl HostHeap {
         if was {
             self.changed.put(index);
         }
-        stale
     }
 
     /// Writes `word` (stride | format kind) for view-heap slot `index` into
