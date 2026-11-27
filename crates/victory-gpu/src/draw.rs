@@ -1122,7 +1122,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let view = if incremental { host.mirror_for_buffer_sweep(index, handle) } else { host.mirror(index, handle, true) }?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+        let Some((shadow, address, len)) = host.bound_buffer_copy(index, &view) else {
             // A buffer may not have a resolvable host copy yet; keep a
             // retry in the dirty queue, rather than silently dropping it.
             if incremental && view.is_buffer() { host.retry_buffer_sweep(index); }
@@ -3842,7 +3842,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable_bound(list, u.kind, &view, host, index);
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -3966,7 +3966,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable_bound(list, u.kind, &view, host, first + u.table_offset_dwords / 8);
                     }
                 }
                 for k in selected {
@@ -3977,7 +3977,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable_bound(list, kind, &view, host, first + k);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -4045,7 +4045,7 @@ impl State {
                         } else {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &binding.view);
+                            readable_bound(list, kind, &binding.view, host, index);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -4075,7 +4075,7 @@ impl State {
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable_bound(list, kind, &view, host, index);
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -4115,7 +4115,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable_bound(list, kind, &view, host, index);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4869,12 +4869,24 @@ impl RecordHash {
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    readable_inner(list, kind, view, None);
+}
+
+fn readable_bound(list: &HostList, kind: ResourceType, view: &View, host: &crate::descriptor::host::HostHeap, index: u32) {
+    readable_inner(list, kind, view, Some((host, index)));
+}
+
+fn readable_inner(list: &HostList, kind: ResourceType, view: &View, bound: Option<(&crate::descriptor::host::HostHeap, u32)>) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let copy = match bound {
+        Some((host, index)) => host.bound_buffer_copy(index, view),
+        None => crate::descriptor::host::buffer_copy(view),
+    };
+    if let Some((shadow, address, len)) = copy {
         let writes = kind == ResourceType::Uav && (STORES.get() || !write_skip());
         #[cfg(feature = "diagnostics")]
         if writes {

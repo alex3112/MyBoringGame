@@ -2788,6 +2788,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        forget_native(self);
         if let Some(bytes) = self.before.get_mut().unwrap_or_else(|e| e.into_inner()).as_ref() {
             crate::memory_audit::SNAPSHOT.remove(bytes.capacity() as u64);
         }
@@ -5122,6 +5123,76 @@ mod land_tests {
     }
 }
 
+// Native backing identity is independent of the current guest lookup.
+// Descriptors can outlive a change of the guest's registered buffers or
+// the arrival of another containing window. Weak entries do not extend
+// resource lifetime; the Shadow ID prevents removal of a reused key.
+type NativeBacking = (u64, std::sync::Weak<Shadow>);
+const BACKING_SHARDS: usize = 64;
+static NATIVE_BACKINGS: std::sync::OnceLock<[Mutex<std::collections::HashMap<usize, NativeBacking>>; BACKING_SHARDS]> = std::sync::OnceLock::new();
+static BACKING_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn unified_backing() -> bool {
+    crate::toggled!("VICTORY_UNIFIED_BACKING")
+}
+
+fn backing_shard(key: usize) -> usize {
+    ((key >> 4) ^ (key >> 12)) & (BACKING_SHARDS - 1)
+}
+
+fn native_key(buffer: &ID3D12Resource) -> usize {
+    windows::core::Interface::as_raw(buffer) as usize
+}
+
+fn publish_shadow(shadow: Shadow) -> Arc<Shadow> {
+    let shadow = Arc::new(shadow);
+    if unified_backing() {
+        let key = native_key(&shadow.buffer);
+        let shards = NATIVE_BACKINGS.get_or_init(|| std::array::from_fn(|_| Mutex::default()));
+        shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner())
+            .insert(key, (shadow.id(), Arc::downgrade(&shadow)));
+    }
+    shadow
+}
+
+fn forget_native(shadow: &Shadow) {
+    if let Some(shards) = NATIVE_BACKINGS.get() {
+        let key = native_key(&shadow.buffer);
+        let mut map = shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&key).is_some_and(|(id, _)| *id == shadow.id()) {
+            map.remove(&key);
+        }
+    }
+}
+
+/// The exact native allocation named by a live descriptor. Do not return
+/// a different copy merely because it now contains the same guest range.
+pub(crate) fn native_backing(buffer: &ID3D12Resource, address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let key = native_key(buffer);
+    let shards = NATIVE_BACKINGS.get()?;
+    let shadow = {
+        let map = shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&key)?.1.upgrade()?
+    };
+    let (start, width) = shadow.span();
+    if address < start || address.checked_add(len)? > start.checked_add(width)? {
+        return None;
+    }
+    BACKING_STATS[2].fetch_add(1, Ordering::Relaxed);
+    Some(shadow)
+}
+
+pub(crate) fn backing_fallback() {
+    BACKING_STATS[3].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn backing_line(frames: f64) {
+    let [registered, window_bytes, resolved, fallback] = BACKING_STATS.each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!("unified backing per frame (VICTORY_UNIFIED_BACKING={}): {:.2} registered aliases, {:.2} MiB window requests shared, {:.0} native descriptor resolutions, {:.0} fallback",
+        u8::from(unified_backing()), registered, window_bytes / 1048576.0, resolved, fallback);
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -5357,6 +5428,27 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    // Equal guest spans use a single allocation and its coherence
+    // journal, regardless of how many buffer objects describe them.
+    // Also share an already allocated containing registered buffer if
+    // its end is identical (unsized root reads keep their old bound).
+    // No remapping of descriptors that already exist.
+    if unified_backing() && map.get(&key)?.shadow.is_none() {
+        let end = map.get(&key)?.end;
+        let shared = map.range(..=(key.0, usize::MAX)).rev().take(64)
+            .filter(|(k, e)| **k != key && e.end == end)
+            .filter_map(|(_, e)| e.shadow.as_ref())
+            .find(|s| !s.in_place() && s.span().0 <= key.0 && s.span().0 + s.span().1 == end)
+            .cloned();
+        if let Some(shared) = shared {
+            map.get_mut(&key)?.shadow = Some(shared.clone());
+            BACKING_STATS[0].fetch_add(1, Ordering::Relaxed);
+            if quick {
+                remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), &shared);
+            }
+            return Some(shared);
+        }
+    }
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -5369,7 +5461,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            entry.shadow = Some(publish_shadow(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
@@ -5415,7 +5507,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
-        let shadow = Arc::new(shadow);
+        let shadow = publish_shadow(shadow);
         if shadow.card.is_some() {
             register_card(&shadow);
         }
@@ -5630,7 +5722,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
                 owner: Default::default(),
         size: len,
     });
-    let shadow = Arc::new(shadow);
+    let shadow = publish_shadow(shadow);
     register_card(&shadow);
     Some(shadow)
 }
@@ -5671,6 +5763,13 @@ fn reused_window(shadow: &Shadow, named: WindowKey) {
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    // A sized descriptor's true span, not the rounded allocation request,
+    // determines whether an existing backing can hold it. Key the stable
+    // alias by that true span: another view in the same grid cell can
+    // require different coverage. Unsized views retain their old end.
+    let alias = if unified_backing() && !unsized_ask {
+        ((address, end - address), false)
+    } else { (named, unsized_ask) };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
@@ -5695,7 +5794,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         // alias between checking it and taking the exact allocation.
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if !tails() {
-            if let Some(key) = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).get(&(named, unsized_ask))
+            if let Some(key) = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner()).get(&alias)
                 && let Some(shadow) = map.get(key)
             {
                 note(shadow);
@@ -5728,7 +5827,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     if !tails() {
         let mut aliases = WINDOW_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(key) = aliases.get(&(named, unsized_ask))
+        if let Some(key) = aliases.get(&alias)
             && let Some(shadow) = map.get(key)
         {
             note(shadow);
@@ -5738,7 +5837,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         // The exact name wins if already allocated. Otherwise reuse an
         // existing containing allocation, even one starting in an earlier
         // cell. Transient draw requests need only their actual range.
-        let wanted = if any && !unsized_ask { (address, end - address) } else { named };
+        let wanted = if !unsized_ask && (any || unified_backing()) { (address, end - address) } else { named };
         let key = if map.contains_key(&named) {
             Some(named)
         } else {
@@ -5749,7 +5848,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         {
             if key != named {
                 if !any {
-                    aliases.insert((named, unsized_ask), key);
+                    aliases.insert(alias, key);
+                }
+                if unified_backing() {
+                    BACKING_STATS[1].fetch_add(named.1, Ordering::Relaxed);
                 }
                 reused_window(shadow, named);
             }
@@ -5776,7 +5878,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        let shadow = publish_shadow(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -5789,7 +5891,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let mut shadow = Shadow::new(buffer, data, gpu, start, len);
         shadow.window = true;
         shadow.mapped = true;
-        let shadow = Arc::new(shadow);
+        let shadow = publish_shadow(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -5825,7 +5927,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
-    let shadow = Arc::new(shadow);
+    let shadow = publish_shadow(shadow);
     if shadow.card.is_some() {
         register_card(&shadow);
     }
@@ -5889,7 +5991,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let shadow = publish_shadow(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);

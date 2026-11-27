@@ -3765,6 +3765,23 @@ impl HostHeap {
         self.made.get(index).is_some_and(|key| key != 0)
     }
 
+    /// Use the native allocation this slot actually references, rather
+    /// than resolving the same guest address a second time through a map
+    /// that can have changed since descriptor creation.
+    pub(crate) fn bound_buffer_copy(&self, index: u32, view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        if view.is_buffer() && !matches!(view, View::Constant(..)) {
+            if let Some((address, len)) = buffer_range(view)
+                && len != 0
+                && let Some(buffer) = self.kept_in(index)
+                && let Some(shadow) = crate::shadow::native_backing(&buffer, address, len)
+            {
+                return Some((shadow, address, len));
+            }
+            crate::shadow::backing_fallback();
+        }
+        buffer_copy(view)
+    }
+
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
     /// resource (diagnostics: a buffer view's slot must show the host copy
     /// that is brought up to date for it).
