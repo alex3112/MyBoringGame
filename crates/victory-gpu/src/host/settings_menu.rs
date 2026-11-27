@@ -385,7 +385,10 @@ impl Menu {
         c.text(411, 290, "Reset sharpening", 19, true, TEXT);
         c.text(28, 329, "AMD Frame Generation", 17, true, ACCENT);
         c.text(28, 348, "Frame Generation", 20, false, TEXT);
-        let fg_label = if self.fg_status.starts_with("Unavailable") { "Unavailable" } else if fsr::generation_requested() { "On (experimental)" } else { "Off" };
+        let fg_label = match super::frame_generation::state_label() {
+            "ACTIVE" => "On - generating", "WARMUP" => "On - warming up",
+            "PAUSED" => "On - paused", "UNAVAILABLE" => "Unavailable", _ => "Off",
+        };
         c.text(411, 348, fg_label, 18, true, TEXT);
         c.text(28, 383, "FidelityFX SDK", 20, false, TEXT);
         c.text(411, 383, "Check SDK", 19, true, TEXT);

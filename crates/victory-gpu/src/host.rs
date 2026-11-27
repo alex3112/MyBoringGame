@@ -9678,7 +9678,14 @@ impl Meter {
                 }
             }
         }
-        let text = format!("Build {} | {fps:.0} fps | {ms:.1} ms/frame | {draws:.0} draws/frame", crate::BUILD_VERSION);
+        let text = if let Some(r) = frame_generation::metrics() {
+            let output = r.submitted.map_or_else(|| "N/A".into(), |n| format!("{n:.1}"));
+            format!("Build {} | {output} FPS submitted | {:.1} native + {:.1} FG | FG {} | {ms:.1} ms/native frame",
+                crate::BUILD_VERSION, r.native, r.generated, frame_generation::state_label())
+        } else {
+            format!("Build {} | {fps:.0} native FPS | FG {} | {ms:.1} ms/frame | {draws:.0} draws/frame",
+                crate::BUILD_VERSION, frame_generation::state_label())
+        };
         let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

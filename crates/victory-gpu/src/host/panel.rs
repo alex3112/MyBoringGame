@@ -27,7 +27,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 12;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -213,7 +213,21 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+        {
+            let rates = super::frame_generation::metrics();
+            let native = rates.map_or(1e3 / ms.max(0.001), |r| r.native);
+            let generated = rates.map_or(0.0, |r| r.generated);
+            let output = rates.and_then(|r| r.submitted);
+            let output = output.map_or_else(|| if victory_core::fsr::generation_requested() { "N/A".into() } else { format!("{native:.1}") }, |v| format!("{v:.1}"));
+            format!("FPS {output}  NATIVE {native:.1}  GEN {generated:.1}")
+        },
+        {
+            let completed = super::frame_generation::metrics().and_then(|r| r.completed);
+            let value = completed.map_or_else(|| "N/A".into(), |v| format!("{v:.1}"));
+            format!("FG {}  DXGI DONE {value}", super::frame_generation::state_label())
+        },
+        format!("NATIVE FRAME {ms:.1} MS  LONGEST {worst:.0}"),
+        "FPS - DXGI SUBMITTED PRESENTS".into(),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),

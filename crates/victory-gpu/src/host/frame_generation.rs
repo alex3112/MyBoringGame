@@ -18,7 +18,103 @@ use super::{Host, HostList, transition};
 use super::fidelityfx::{Header, Library};
 use crate::resource::HostTexture;
 
+mod image_audit;
+
 type Ptr = *mut c_void;
+
+// All FPS values describe a measured interval, not a theoretical multiplier.
+// DXGI's submitted-present count is not a physical scanout counter.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Metrics {
+    pub native: f64,
+    pub generated: f64,
+    pub submitted: Option<f64>,
+    pub completed: Option<f64>,
+}
+static METRICS: Mutex<Option<(Instant, Metrics)>> = Mutex::new(None);
+pub(super) fn metrics() -> Option<Metrics> {
+    METRICS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        .filter(|(at, _)| at.elapsed().as_secs_f64() < 2.5).map(|(_, m)| *m)
+}
+pub(super) fn state_label() -> &'static str {
+    let status = fsr::generation_status();
+    if status.starts_with("Unavailable") { return "UNAVAILABLE"; }
+    if !fsr::generation_requested() { return "OFF"; }
+    if status.starts_with("On - native") {
+        if metrics().is_some_and(|m| m.generated > 0.0) { "ACTIVE" } else { "WARMUP" }
+    } else { "PAUSED" }
+}
+
+/// DXGI refresh statistics only expose the latest sample. We observe them
+/// once per native present, so multi-present intervals are aggregated.
+/// SyncQPCTime is the refresh synchronization clock, not a per-image timestamp.
+struct Pacing {
+    freq: i64,
+    last: Option<DXGI_FRAME_STATISTICS>,
+    first: Option<DXGI_FRAME_STATISTICS>,
+    samples: u64,
+    min: f64,
+    max: f64,
+    sum: f64,
+    multi: u64,
+    unavailable: u64,
+}
+impl Pacing {
+    fn new() -> Self {
+        let mut freq = 0i64;
+        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut freq); }
+        Self { freq, last: None, first: None, samples: 0, min: f64::INFINITY,
+            max: 0.0, sum: 0.0, multi: 0, unavailable: 0 }
+    }
+    fn observe(&mut self, swap: &IDXGISwapChain3) {
+        let mut stats = DXGI_FRAME_STATISTICS::default();
+        if self.freq <= 0 || unsafe { swap.GetFrameStatistics(&mut stats) }.is_err() {
+            self.unavailable += 1;
+            self.last = None;
+            self.first = None;
+            return;
+        }
+        if stats.SyncQPCTime <= 0 { return; }
+        if let Some(old) = self.last {
+            let count = stats.PresentCount.wrapping_sub(old.PresentCount);
+            if count == 0 { return; }
+            let ticks = stats.SyncQPCTime - old.SyncQPCTime;
+            // A disjoint/reset or mode change cannot form a valid interval.
+            if count > 120 || ticks <= 0 || ticks > self.freq * 5 {
+                self.first = Some(stats);
+            } else {
+                let ms = ticks as f64 * 1000.0 / self.freq as f64 / f64::from(count);
+                self.samples += 1;
+                self.multi += u64::from(count > 1);
+                self.min = self.min.min(ms);
+                self.max = self.max.max(ms);
+                self.sum += ms;
+            }
+        }
+        if self.first.is_none() { self.first = Some(stats); }
+        self.last = Some(stats);
+    }
+    fn interval(&mut self) -> Option<f64> {
+        let fps = self.first.zip(self.last).and_then(|(a,b)| {
+            let ticks = b.SyncQPCTime - a.SyncQPCTime;
+            let count = b.PresentCount.wrapping_sub(a.PresentCount);
+            (ticks > 0 && count > 0 && count <= 240).then(|| f64::from(count) * self.freq as f64 / ticks as f64)
+        });
+        if fsr::generation_requested() {
+            tracing::info!(completed_fps = ?fps, samples = self.samples, multi_present_samples = self.multi,
+                unavailable = self.unavailable,
+                mean_interval_ms = (self.samples > 0).then(|| self.sum / self.samples as f64),
+                min_interval_ms = (self.samples > 0).then_some(self.min),
+                max_interval_ms = (self.samples > 0).then_some(self.max),
+                "FFX FG: DXGI refresh timing (aggregated, not individual scanout intervals)");
+        }
+        self.first = self.last;
+        self.samples = 0; self.multi = 0; self.unavailable = 0;
+        self.min = f64::INFINITY; self.max = 0.0; self.sum = 0.0;
+        fps
+    }
+}
+
 type Result<T> = std::result::Result<T, String>;
 type Create = unsafe extern "C" fn(*mut Ptr, *mut Header, *const c_void) -> u32;
 type Destroy = unsafe extern "C" fn(*mut Ptr, *const c_void) -> u32;
@@ -222,6 +318,7 @@ struct Callback {
     ctx: usize, dispatch: Call, reset_frame: AtomicU64,
     generated: AtomicU64, failed: AtomicU64, measured: AtomicU64,
     timer: Option<Timer>,
+    audit: Option<image_audit::Audit>,
 }
 unsafe extern "C" fn interpolate(desc: *mut Generation, user: Ptr) -> u32 {
     if desc.is_null() || user.is_null() { return 1; }
@@ -240,7 +337,12 @@ unsafe extern "C" fn interpolate(desc: *mut Generation, user: Ptr) -> u32 {
         cb.measured.store(if rc == 0 { d.frame } else { 0 }, Ordering::Release);
     }
     if rc == 0 {
-        if !d.reset { cb.generated.fetch_add(u64::from(d.count), Ordering::Relaxed); }
+        if !d.reset {
+            cb.generated.fetch_add(u64::from(d.count), Ordering::Relaxed);
+            if d.count > 0 && let (Some(audit), Some(list)) = (&cb.audit, list) {
+                audit.record(list, d.frame, &d.color, &d.outputs[0]);
+            }
+        }
     } else {
         cb.failed.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(frame = d.frame, rc, "FFX FG: interpolation dispatch failed");
@@ -260,6 +362,7 @@ pub(super) struct Proxy {
     api: Api, swap_ctx: usize, swap_address: usize, provider: u64, session: Option<Session>,
     held: Option<Inputs>, active: bool, last_frame: u64, failed: bool,
     meter: Instant, native: u64, last_present: Option<u32>,
+    pacing: Pacing,
     generated_base: u64, failure_base: u64, prepare_ms: f64, interpolate_ms: f64, samples: u64,
 }
 impl Proxy {
@@ -287,7 +390,7 @@ impl Proxy {
         tracing::info!("FFX FG: native pacing swapchain created (interpolation off)");
         let swap_address = swap.as_raw() as usize;
         Ok((swap, Self { api, swap_ctx, swap_address, provider, session: None, held: None, active: false,
-            last_frame: 0, failed: false, meter: Instant::now(), native: 0, last_present: None,
+            last_frame: 0, failed: false, meter: Instant::now(), native: 0, last_present: None, pacing: Pacing::new(),
             generated_base: 0, failure_base: 0, prepare_ms: 0.0, interpolate_ms: 0.0, samples: 0 }))
     }
     fn wait(&self) -> Result<()> { self.api.call(self.swap_ctx, &header(WAIT_SWAP), self.api.dispatch) }
@@ -308,6 +411,7 @@ impl Proxy {
                 self.failed = true;
                 fsr::request_generation(false);
             }
+            if let Some(audit) = &session.callback.audit { audit.collect(); }
             if let Some(timer) = &session.callback.timer {
                 let measured = session.callback.measured.load(Ordering::Acquire) == self.last_frame;
                 let (prepare, interpolation) = timer.read(measured);
@@ -335,6 +439,7 @@ impl Proxy {
             }
         }
         self.active = false;
+        if let Some(s) = &self.session { if let Some(audit) = &s.callback.audit { audit.reset(); } }
         fsr::set_generation_status(status);
     }
     pub(super) fn blocked(&self) -> bool { self.active && self.failed }
@@ -349,6 +454,11 @@ impl Proxy {
         self.generated_base = 0;
         self.failure_base = 0;
         self.last_frame = 0;
+        self.pacing = Pacing::new();
+        self.last_present = None;
+        self.native = 0;
+        self.meter = Instant::now();
+        *METRICS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         true
     }
     fn config(s: &Session, swap: &IDXGISwapChain3, frame: u64, enabled: bool, hudless: Resource) -> Configure {
@@ -364,7 +474,8 @@ impl Proxy {
             flags, display: size, render, format: 10 };
         let ctx = self.api.create(&mut desc.header)?;
         let callback = Box::new(Callback { ctx, dispatch: self.api.dispatch, reset_frame: AtomicU64::new(0),
-            generated: AtomicU64::new(0), failed: AtomicU64::new(0), measured: AtomicU64::new(0), timer: Timer::new(host) });
+            generated: AtomicU64::new(0), failed: AtomicU64::new(0), measured: AtomicU64::new(0), timer: Timer::new(host),
+            audit: image_audit::Audit::new(host) });
         tracing::info!(?size, ?render, flags, "FFX FG: native 3.1.6 context created");
         Ok(Session { ctx, callback, display: size, render, flags, hudless: None, last: 0 })
     }
@@ -464,6 +575,7 @@ impl Proxy {
     }
     pub(super) fn presented(&mut self, swap: &IDXGISwapChain3, ok: bool) {
         if ok { self.native += 1; }
+        self.pacing.observe(swap);
         let elapsed = self.meter.elapsed().as_secs_f64();
         if elapsed < 1.0 { return; }
         let count = unsafe { swap.GetLastPresentCount() }.ok();
@@ -473,6 +585,10 @@ impl Proxy {
             s.callback.generated.load(Ordering::Relaxed), s.callback.failed.load(Ordering::Relaxed)));
         let gen_fps = generated.saturating_sub(self.generated_base) as f64 / elapsed;
         let errors = failures.saturating_sub(self.failure_base);
+        let completed = self.pacing.interval();
+        *METRICS.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Metrics {
+            native: self.native as f64 / elapsed, generated: gen_fps, submitted: actual, completed,
+        }));
         self.generated_base = generated;
         self.failure_base = failures;
         let [captured, rejected, ambiguous, missing] = INPUT_COUNTS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
