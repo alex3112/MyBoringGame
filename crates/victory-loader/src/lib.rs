@@ -41,6 +41,8 @@ mod tls;
 pub mod write_sites;
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod fidelityfx_audit;
 
 #[cfg(windows)]
 pub use crash::{

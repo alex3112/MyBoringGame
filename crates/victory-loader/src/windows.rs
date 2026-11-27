@@ -175,9 +175,13 @@ impl ImportResolver for WithTitleDlls<'_> {
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(dll))
             .and_then(|(_, image)| image.export_symbol(symbol))
-            .map_or(Resolution::Missing, |address| Resolution::Found {
-                address,
-                provenance: Provenance::Title,
+            .map_or(Resolution::Missing, |address| {
+                #[cfg(feature = "diagnostics")]
+                let address = match symbol {
+                    ImportSymbol::Name { name, .. } => crate::fidelityfx_audit::wrap(dll, name, address),
+                    ImportSymbol::Ordinal(_) => address,
+                };
+                Resolution::Found { address, provenance: Provenance::Title }
             })
     }
 }
