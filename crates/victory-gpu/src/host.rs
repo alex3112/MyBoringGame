@@ -4315,6 +4315,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::land::gpu_homes_line(frames);
     if relay() {
         release_line(frames);
         let counts = FETCH_COPY_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5052,7 +5053,7 @@ impl Host {
                         crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         #[cfg(feature = "diagnostics")]
-                        traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
+                        traffic::moved(traffic::UP, shadow, ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
                             let raw = shadow.buffer.as_raw();
                             if !transitioned.contains(&raw) {
@@ -5398,6 +5399,11 @@ impl Host {
                                 if land::skip_on() {
                                     continue;
                                 }
+                                // A direct-queue fetch already merged these exact bytes
+                                // after this producer. No new CPU visibility boundary.
+                                if land::gpu_home_reuse(r.shadow.card_local(), fetch.as_ref().is_some_and(|f| f.queue.is_none()), (hi - lo) as u64) {
+                                    continue;
+                                }
                             }
                             if upcheck::on() {
                                 upcheck::fetched(r.shadow.id(), lo);
@@ -5433,7 +5439,7 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         for (shadow, lo, hi, _) in &pieces {
-            traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
+            traffic::moved(traffic::FETCHED, shadow, std::iter::once((*lo, *hi)));
         }
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.

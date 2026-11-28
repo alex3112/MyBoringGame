@@ -69,6 +69,48 @@ pub(crate) fn skip_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
 }
 
+/// The first GPU-home experiment only reuses an already merged result.
+/// Native title reads are not intercepted: never extend visibility beyond
+/// a landing, or rely on a copy-queue fetch racing later writes.
+pub(crate) fn gpu_homes_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_HOMES").is_none_or(|v| v != "0"))
+}
+
+static GPU_HOMES_REUSE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn gpu_home_reusable(enabled: bool, local: bool, direct: bool) -> bool {
+    enabled && local && direct
+}
+
+/// Call only after Had::holds proves a previous fetch, already merged into
+/// title memory, covered the entire range behind this producer's fence.
+pub(crate) fn gpu_home_reuse(local: bool, direct: bool, bytes: u64) -> bool {
+    if !gpu_home_reusable(gpu_homes_on(), local, direct) { return false; }
+    GPU_HOMES_REUSE[0].fetch_add(1, Ordering::Relaxed);
+    GPU_HOMES_REUSE[1].fetch_add(bytes, Ordering::Relaxed);
+    true
+}
+
+pub(crate) fn gpu_homes_line(frames: f64) {
+    let [pieces, bytes] = GPU_HOMES_REUSE.each_ref()
+        .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    tracing::info!("GPU homes phase 1 (VICTORY_GPU_HOMES={}): {:.0} proven redundant readback requests avoided/frame, {:.2} MiB/frame logical coverage; persistent ownership disabled",
+        u8::from(gpu_homes_on()), pieces, bytes / 1048576.0);
+}
+
+#[cfg(test)]
+#[test]
+fn gpu_homes_reuse_requires_local_direct_and_enabled() {
+    for enabled in [false, true] {
+        for local in [false, true] {
+            for direct in [false, true] {
+                assert_eq!(gpu_home_reusable(enabled, local, direct), enabled && local && direct);
+            }
+        }
+    }
+}
+
 /// Since the last frame-rate line; microseconds first.
 pub(crate) mod stat {
     /// Which pieces to fetch; their list recorded and sent.
