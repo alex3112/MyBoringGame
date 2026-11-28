@@ -1981,17 +1981,22 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    // Most large batches are tiny, clean refresh checks. Amortize the
+    // contended scheduler atomic, without changing any individual check.
+    let chunk = if crate::watch::refresh_version_fast() && n >= 256 { 8 } else { 1 };
+    let threads = (wide_threads() + 1).min(n.div_ceil(chunk));
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
+                    let first = next.fetch_add(chunk, Ordering::Relaxed);
+                    if first >= n {
                         break;
                     }
-                    work(i);
+                    for i in first..first.saturating_add(chunk).min(n) {
+                        work(i);
+                    }
                 }
             }) as Job
         })

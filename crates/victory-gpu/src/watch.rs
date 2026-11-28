@@ -831,6 +831,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
+pub(crate) fn refresh_version_fast() -> bool {
+    crate::toggled!("VICTORY_REFRESH_VERSION_FAST")
+}
+
+static SHORT_RANGE_REUSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn short_range_line(frames: f64) {
+    tracing::info!("short refresh version proof (VICTORY_REFRESH_VERSION_FAST={}): {:.0} clean short ranges/frame without per-page stamp scan",
+        u8::from(refresh_version_fast()), SHORT_RANGE_REUSE.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0));
+}
+
+fn range_stamp_covers(latest: &BTreeMap<usize, u64>, first: usize, last: usize, ranged: u64) -> bool {
+    ranged != 0 && first < last && (first / JOURNAL_BLOCK..=(last - 1) / JOURNAL_BLOCK)
+        .all(|block| latest.get(&block).copied().unwrap_or(0) <= ranged)
+}
+
+#[cfg(test)]
+#[test]
+fn short_range_proof_checks_each_block_and_requires_a_stamp() {
+    let latest = BTreeMap::from([(0, 4), (1, 7)]);
+    assert!(!range_stamp_covers(&latest, 1, 2, 0));
+    assert!(range_stamp_covers(&latest, 1, 2, 4));
+    assert!(!range_stamp_covers(&latest, 63, 65, 4));
+    assert!(range_stamp_covers(&latest, 63, 65, 7));
+    assert!(!range_stamp_covers(&latest, 65, 65, 7));
+}
+
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// and `ranged` (the asking after which a range that holds this one was
@@ -854,6 +881,10 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     };
     if first >= last { return true; }
     if last - first < JOURNAL_BLOCK {
+        if refresh_version_fast() && indexed_ranges() && range_stamp_covers(&j.latest, first, last, ranged) {
+            SHORT_RANGE_REUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
         return (ranged != 0 || taken.iter().all(|&at| at != 0))
             && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged));
     }

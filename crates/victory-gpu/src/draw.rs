@@ -670,33 +670,69 @@ struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>, Vec<u64>);
 // of its Shadow references; the index cannot keep a released GPU buffer alive.
 #[derive(Default)]
 struct SpanMembers {
-    starts: std::collections::BTreeSet<(u64, u32)>,
-    ends: std::collections::BTreeSet<(u64, u32)>,
+    slots: std::collections::HashMap<u32, (u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    // Representative is the first (from, slot) just as in the old index.
+    bounds: Option<(u32, u64, u64)>,
+}
+
+impl SpanMembers {
+    fn insert(&mut self, slot: u32, from: u64, to: u64) {
+        let empty = self.slots.is_empty();
+        self.slots.insert(slot, (from, to));
+        if empty {
+            self.bounds = Some((slot, from, to));
+        } else if let Some((old, a, b)) = self.bounds {
+            self.bounds = Some(if (from, slot) < (a, old) {
+                (slot, from, b.max(to))
+            } else {
+                (old, a, b.max(to))
+            });
+        }
+    }
+
+    fn remove(&mut self, slot: u32) {
+        if let Some((_, to)) = self.slots.remove(&slot)
+            && self.bounds.is_some_and(|(first, _, end)| first == slot || to == end) {
+            self.bounds = None;
+        }
+    }
+
+    fn span(&mut self) -> (u32, u64, u64) {
+        if let Some(bounds) = self.bounds { return bounds; }
+        let mut first = (u64::MAX, u32::MAX);
+        let mut end = 0;
+        for (&slot, &(from, to)) in &self.slots {
+            first = first.min((from, slot));
+            end = end.max(to);
+        }
+        let bounds = (first.1, first.0, end);
+        debug_assert!(!self.slots.is_empty());
+        self.bounds = Some(bounds);
+        bounds
+    }
 }
 
 #[derive(Default)]
 struct SpanIndex {
-    slots: std::collections::HashMap<u32, (u64, u64, u64)>,
-    copies: std::collections::HashMap<u64, SpanMembers>,
+    slots: std::collections::HashMap<u32, (u64, u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    copies: std::collections::HashMap<u64, SpanMembers, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl SpanIndex {
     // False means nothing changed, including the identity of the Shadow.
     fn set(&mut self, slot: u32, next: Option<(u64, u64, u64)>) -> bool {
         if self.slots.get(&slot).copied() == next { return false; }
-        if let Some((id, from, to)) = self.slots.remove(&slot) {
+        if let Some((id, _, _)) = self.slots.remove(&slot) {
             let empty = {
                 let members = self.copies.get_mut(&id).expect("indexed copy");
-                members.starts.remove(&(from, slot));
-                members.ends.remove(&(to, slot));
-                members.starts.is_empty()
+                members.remove(slot);
+                members.slots.is_empty()
             };
             if empty { self.copies.remove(&id); }
         }
         if let Some((id, from, to)) = next {
             let members = self.copies.entry(id).or_default();
-            members.starts.insert((from, slot));
-            members.ends.insert((to, slot));
+            members.insert(slot, from, to);
             self.slots.insert(slot, (id, from, to));
         }
         true
@@ -709,10 +745,9 @@ impl SpanIndex {
 
     // One representative slot and the same min/max envelope as the old
     // full reduction, including holes. Removing a boundary shrinks it.
-    fn spans(&self) -> impl Iterator<Item = (u64, u32, u64, u64)> + '_ {
-        self.copies.iter().map(|(&id, members)| {
-            let &(from, slot) = members.starts.first().expect("nonempty copy");
-            let &(to, _) = members.ends.last().expect("nonempty copy");
+    fn spans(&mut self) -> impl Iterator<Item = (u64, u32, u64, u64)> + '_ {
+        self.copies.iter_mut().map(|(&id, members)| {
+            let (slot, from, to) = members.span();
             (id, slot, from, to)
         })
     }
@@ -720,7 +755,7 @@ impl SpanIndex {
 
 fn heap_incremental() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_INCREMENTAL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_INCREMENTAL").is_none_or(|v| v != "0"))
 }
 
 // Inspected slots, actual index changes, retained slots, copies, time
@@ -728,6 +763,7 @@ fn heap_incremental() -> bool {
 static HEAP_INDEX_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 pub(crate) fn heap_index_log(frames: f64) {
+    crate::watch::short_range_line(frames);
     let v = HEAP_INDEX_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
     if v[0] + v[2] > 0.0 {
         tracing::info!("incremental buffer heap (VICTORY_HEAP_INCREMENTAL={}): {:.0} inspected slots, {:.0} index changes, {:.0} retained views, {:.0} resource spans, {:.2} ms span reduction per frame",

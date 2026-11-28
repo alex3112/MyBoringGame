@@ -1082,6 +1082,9 @@ pub(super) fn lifetime_line(frames: f64) {
     let templates = TEMPLATE_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     tracing::info!("persistent descriptor table templates per frame (VICTORY_PERSISTENT_TABLES={}): {:.0} hits, {:.0} builds, {:.0} slots copied in {:.0} contiguous runs",
         u8::from(persistent_tables()), templates[0], templates[1], templates[2], templates[3]);
+    let stable = STABLE_VIEW_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("persistent single buffer views per frame (VICTORY_PERSISTENT_VIEW_CACHE={}): {:.0} hits, {:.0} builds; template cache {} entries",
+        u8::from(persistent_view_cache()), stable[0], stable[1], if persistent_view_cache() { TEMPLATE_EXPANDED } else { TEMPLATE_COUNT });
     let waits = WAIT_DETAIL.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     let refs = DYNAMIC_REF_STATS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
     tracing::info!(
@@ -3086,7 +3089,11 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = if let Some(resource) = persistent_list_view(words, &view, views.slot(at), views.slot(at + 1)) {
+                    Some(resource)
+                } else {
+                    make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?
+                };
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -3140,7 +3147,7 @@ impl HostHeap {
         }
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         keys.hash(&mut hash);
-        let entry = hash.finish() as usize % TEMPLATE_COUNT;
+        let hash = hash.finish() as usize;
         TABLE_TEMPLATES.with(|cache| {
             let mut cache = cache.borrow_mut();
             if cache.is_none() {
@@ -3151,7 +3158,12 @@ impl HostHeap {
                 cache.recording = recording;
                 cache.ready.clear();
             }
-            let hit = cache.entries[entry].as_ref().is_some_and(|t| t.keys == keys);
+            let ways = if persistent_view_cache() { CACHE_WAYS } else { 1 };
+            let (entry, hit) = cache_choice(hash, cache.entries.len(), ways, |i| {
+                cache.entries[i].as_ref().map(|t| (t.keys == keys, t.stamp))
+            });
+            cache.clock = cache.clock.wrapping_add(1);
+            let stamp = cache.clock;
             if !hit {
                 // Invalidate before any write: failure leaves no hit on a
                 // partially overwritten entry. Recheck the returned native
@@ -3165,7 +3177,9 @@ impl HostHeap {
                         return None;
                     }
                 }
-                cache.entries[entry] = Some(TableTemplate { keys, runs });
+                cache.entries[entry] = Some(TableTemplate { keys, runs, stamp });
+            } else if let Some(template) = cache.entries[entry].as_mut() {
+                template.stamp = stamp;
             }
             let template = cache.entries[entry].as_ref()?;
             let host = host()?;
@@ -6320,6 +6334,10 @@ impl TemplateBinding {
 fn template_binding(handle: u64) -> Option<TemplateBinding> {
     let words = super::record_at(handle)?;
     let view = super::view_at(words[1], words[2])?;
+    template_binding_for(words, view)
+}
+
+fn template_binding_for(words: [u32; 3], view: View) -> Option<TemplateBinding> {
     let kind = view_elements(&view)?;
     let (base, width) = buffer_extent(&view)?;
     let (start, len) = buffer_range(&view)?;
@@ -6340,6 +6358,84 @@ fn template_binding(handle: u64) -> Option<TemplateBinding> {
 
 const TEMPLATE_WIDTH: u32 = 64;
 const TEMPLATE_COUNT: usize = 128;
+const TEMPLATE_EXPANDED: usize = 256;
+const CACHE_WAYS: usize = 4;
+const STABLE_VIEW_COUNT: usize = 2048;
+
+fn persistent_view_cache() -> bool {
+    persistent_tables() && crate::toggled!("VICTORY_PERSISTENT_VIEW_CACHE")
+}
+
+// Exact key comparison on every hit; hash selects a set, never identity.
+// Prefer an empty way, otherwise evict the oldest entry in the set.
+fn cache_choice(hash: usize, count: usize, ways: usize, state: impl Fn(usize) -> Option<(bool, u64)>) -> (usize, bool) {
+    let base = (hash % (count / ways)) * ways;
+    let (mut empty, mut oldest) = (None, (base, u64::MAX));
+    for i in base..base + ways {
+        match state(i) {
+            Some((true, _)) => return (i, true),
+            Some((false, stamp)) if stamp < oldest.1 => oldest = (i, stamp),
+            None => { if empty.is_none() { empty = Some(i); } }
+            _ => {}
+        }
+    }
+    (empty.unwrap_or(oldest.0), false)
+}
+
+// CPU-only cached descriptors for ordinary SRV buffers. Never retain a
+// native resource in this cache. Resolve its record and registered Shadow
+// on every cross-recording use. No texture, UAV, CBV or remap experiment.
+fn persistent_list_view(words: [u32; 3], view: &View, to: D3D12_CPU_DESCRIPTOR_HANDLE, twin: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    if !persistent_view_cache() || crate::vum::physical_experiment()
+        || crate::draw::view_kind(view) != Some(victory_shader::native::ResourceType::Srv) {
+        return None;
+    }
+    let b = template_binding_for(words, view.clone())?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    b.key.hash(&mut hash);
+    TABLE_TEMPLATES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() { *cache = Some(TableTemplates::new()?); }
+        let cache = cache.as_mut()?;
+        let (entry, hit) = cache_choice(hash.finish() as usize, cache.stable.len(), CACHE_WAYS,
+            |i| cache.stable[i].map(|(key, stamp)| (key == b.key, stamp)));
+        let at = cache.stable_slot(entry, false);
+        let raw = cache.stable_slot(entry, true);
+        if !hit {
+            cache.stable[entry] = None;
+            let made = make_twinned(&b.view, at, Some(raw))??;
+            if made.as_raw() != b.shadow.buffer.as_raw() { return None; }
+        }
+        let native = host()?;
+        // SAFETY: all four handles are in CPU-only heaps on this thread;
+        // the live Shadow supplies resource ownership to ListViews.
+        unsafe {
+            native.device.CopyDescriptorsSimple(1, to, at, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            native.device.CopyDescriptorsSimple(1, twin, raw, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        cache.clock = cache.clock.wrapping_add(1);
+        cache.stable[entry] = Some((b.key, cache.clock));
+        STABLE_VIEW_STATS[usize::from(!hit)].fetch_add(1, Relaxed);
+        Some(b.shadow.buffer.clone())
+    })
+}
+
+static STABLE_VIEW_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(test)]
+#[test]
+fn cache_set_prefers_exact_hit_then_empty_then_oldest() {
+    let mut states = [Some((false, 4)), None, Some((true, 2)), Some((false, 1))];
+    assert_eq!(cache_choice(0, 4, 4, |i| states[i]), (2, true));
+    states[2] = Some((false, 2));
+    assert_eq!(cache_choice(0, 4, 4, |i| states[i]), (1, false));
+    states[1] = Some((false, 5));
+    assert_eq!(cache_choice(0, 4, 4, |i| states[i]), (3, false));
+    assert_eq!(cache_choice(3, 8, 1, |_| None), (3, false));
+}
 
 fn template_runs(keys: &[Option<TemplateKey>]) -> Vec<(u32, u32)> {
     let mut runs = Vec::new();
@@ -6358,6 +6454,7 @@ fn template_runs(keys: &[Option<TemplateKey>]) -> Vec<(u32, u32)> {
 struct TableTemplate {
     keys: Vec<Option<TemplateKey>>,
     runs: Vec<(u32, u32)>,
+    stamp: u64,
 }
 
 struct TableTemplates {
@@ -6365,6 +6462,8 @@ struct TableTemplates {
     step: usize,
     start: usize,
     entries: Vec<Option<TableTemplate>>,
+    stable: Vec<Option<(TemplateKey, u64)>>,
+    clock: u64,
     recording: u64,
     ready: std::collections::HashMap<TemplateKey, (u64, usize, bool)>,
 }
@@ -6372,19 +6471,27 @@ struct TableTemplates {
 impl TableTemplates {
     fn new() -> Option<Self> {
         let host = host()?;
+        let count = if persistent_view_cache() { TEMPLATE_EXPANDED } else { TEMPLATE_COUNT };
+        let stable = if persistent_view_cache() { STABLE_VIEW_COUNT } else { 0 };
         // SAFETY: a non-shader-visible heap; only the owning CPU thread
         // ever reads or writes its descriptors.
         unsafe {
             let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: TEMPLATE_COUNT as u32 * TEMPLATE_WIDTH * 2,
+                NumDescriptors: count as u32 * TEMPLATE_WIDTH * 2 + stable as u32 * 2,
                 ..Default::default()
             }).ok()?;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
-            Some(Self { heap, step, start, entries: (0..TEMPLATE_COUNT).map(|_| None).collect(),
-                recording: 0, ready: Default::default() })
+            Some(Self { heap, step, start, entries: (0..count).map(|_| None).collect(),
+                stable: vec![None; stable], clock: 0, recording: 0, ready: Default::default() })
         }
+    }
+
+    fn stable_slot(&self, entry: usize, twin: bool) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(entry < self.stable.len());
+        let index = self.entries.len() * TEMPLATE_WIDTH as usize * 2 + entry * 2 + usize::from(twin);
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + index * self.step }
     }
 
     fn slot(&self, entry: usize, k: u32, twin: bool) -> D3D12_CPU_DESCRIPTOR_HANDLE {
