@@ -6442,7 +6442,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        if crate::vum::demand::resident_on() && (!late || !relay() || !land::on() || torn::on() || upcheck::on()) {
+        if crate::vum::demand::resident_on() && (!late || !relay() || !crate::land::on() || torn::on() || upcheck::on()) {
             crate::vum::demand::resolve_all();
         }
         if crate::vum::demand::pending() {
@@ -6771,7 +6771,7 @@ impl Host {
             let mapping = physical_send_guard(runs,&descriptor_heaps);
             let back = crate::picked::with(declared, &picked.written);
             let resident = crate::vum::demand::resident_on() && flown
-                && land::on() && !torn::on() && !upcheck::on() && card.is_some();
+                && crate::land::on() && !torn::on() && !upcheck::on() && card.is_some();
             if resident {
                 // All earlier write ranges remain in LINE.written until
                 // the relay finishes merging them, even if taken in hand.
