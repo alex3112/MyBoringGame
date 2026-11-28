@@ -75,6 +75,7 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 const NATIVE_WATCH_MIN: usize = MIB;
 const WATCHED_HEAP_HEADER: usize = 1usize << (usize::BITS - 1);
 const VUM_HEAP_HEADER: usize = 1usize << (usize::BITS - 2);
+const DEMAND_HEAP_HEADER: usize = 1usize << (usize::BITS - 3);
 static NATIVE_WATCHED: LazyLock<Mutex<BTreeMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static NATIVE_WATCH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -431,6 +432,16 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // VUM uses the allocator whose full-allocation lifetime we own. No
     // ordinary VirtualAlloc or physical-page remapping semantics change.
     if size >= NATIVE_WATCH_MIN && layout.align() <= PAGE {
+        if let Some(base) = victory_gpu::vum_demand_allocate(layout.size(), attributes) {
+            let base = base as *mut u8;
+            unsafe {
+                let user = base.add(layout.align());
+                user.sub(HEADER).cast::<[usize; 2]>()
+                    .write([layout.size(), layout.align() | DEMAND_HEAP_HEADER]);
+                victory_gpu::memory_audit::TITLE_HEAP.add(layout.size() as u64);
+                return user.cast();
+            }
+        }
         if let Some(base) = victory_gpu::vum_allocate(layout.size(), attributes) {
             let base = base as *mut u8;
             unsafe {
@@ -500,6 +511,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & DEMAND_HEAP_HEADER != 0 {
+            let base = user.sub(align & !DEMAND_HEAP_HEADER);
+            if victory_gpu::vum_demand_release(base as usize) {
+                victory_gpu::memory_audit::TITLE_HEAP.remove(size as u64);
+            }
+            return;
+        }
         if align & VUM_HEAP_HEADER != 0 {
             let base = user.sub(align & !VUM_HEAP_HEADER);
             if victory_gpu::vum_release(base as usize) {

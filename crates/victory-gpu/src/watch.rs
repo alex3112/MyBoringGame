@@ -2191,8 +2191,25 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     here
 }
 
+/// An experimental managed page may be made inaccessible only while
+/// the usual write guard excludes CPU writers and kernel writes.
+pub(crate) fn demand_guard(at: usize, admit: impl FnOnce() -> bool) -> bool {
+    if at % BLOCK != 0 { return false; }
+    let g = guards();
+    let block = at / BLOCK;
+    g.protected.contains(block) && g.clean.contains(block)
+        && !g.left_alone(block) && !g.aliased.contains(block)
+        && admit()
+}
+
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
+    // Restore the GPU version before the ordinary write guard is opened.
+    if crate::vum::demand::pending() {
+        for &block in blocks {
+            crate::vum::demand::resolve_range(block * BLOCK, BLOCK);
+        }
+    }
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2228,6 +2245,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::vum::demand::resolve_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2255,6 +2273,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::vum::demand::resolve_range(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2664,6 +2683,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::vum::demand::resolve_mapping(at, len);
     crate::vum::homes::invalidate();
     let mut g = guards();
     let first = at / BLOCK;
@@ -2718,6 +2738,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    crate::vum::demand::resolve_mapping(at, len);
     crate::vum::homes::invalidate();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -2770,6 +2791,16 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // The demand handler runs before the safecopy failure exit and
+        // before the ordinary write guard. It never waits for a guest
+        // submission; its source is an already completed immutable snapshot.
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && matches!(r.ExceptionInformation[0], READ | WRITE)
+            && crate::vum::demand::fault(r.ExceptionInformation[1], r.ExceptionInformation[0] == WRITE)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE

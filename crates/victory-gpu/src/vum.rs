@@ -7,6 +7,7 @@
 
 pub(crate) mod virtual_address;
 pub(crate) mod homes;
+pub(crate) mod demand;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

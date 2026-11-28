@@ -52,6 +52,8 @@ mod vum;
 pub use vum::{allocate as vum_allocate, release as vum_release, physical_experiment as vum_physical_experiment,
     physical_budget as vum_physical_budget, register_pool as vum_register_pool};
 #[cfg(windows)]
+pub use vum::demand::{allocate as vum_demand_allocate, release as vum_demand_release};
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;

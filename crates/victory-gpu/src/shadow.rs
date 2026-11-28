@@ -3321,6 +3321,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
+        crate::vum::demand::resolve_range(address, len);
         if self.place.is_some() {
             return;
         }
@@ -3990,6 +3991,13 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if let Some(gaps) = crate::vum::demand::refresh_gaps(self.id, from, to) {
+            return gaps.into_iter().map(|(a,b)| self.update_unowned(a,b)).sum();
+        }
+        self.update_unowned(from, to)
+    }
+
+    fn update_unowned(&self, from: usize, to: usize) -> usize {
         // The producer index partitions the request into GPU-owned bytes
         // and CPU-authoritative gaps. GPU ownership is retained until the
         // existing flight count reaches zero after landing. CPU changes
@@ -4059,6 +4067,9 @@ impl Shadow {
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return true;
+        }
+        if let Some(covered) = crate::vum::demand::refresh_covered(self.id, from, to) {
+            return covered;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
@@ -4504,6 +4515,7 @@ impl Shadow {
     /// is then what differs from them when the submission has run. The range
     /// is declared written by it, and its sends are taken.
     pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
+        crate::vum::demand::resolve_range(address, bytes.len());
         let (from, to) = self.inside(address, bytes.len());
         if from >= to || self.place.is_some() {
             return;
@@ -4525,6 +4537,22 @@ impl Shadow {
     /// Of a copy in the card's memory: where its CPU side is.
     pub(crate) fn card_data(&self) -> *const u8 {
         self.data
+    }
+
+    /// The relay holds the submission lock and the producer fence has
+    /// completed. Only an exact full page without unsent/newer CPU bytes
+    /// can become a managed demand page.
+    pub(crate) fn demand_mirror(&self, lo: usize, hi: usize, after: u64) -> Option<usize> {
+        let home = self.card.as_ref()?;
+        if !home.local || self.window || self.place.is_some() || self.data.is_null()
+            || hi.checked_sub(lo)? != PAGE || hi > self.len as usize
+            || (self.start as usize + lo) % PAGE != 0
+            || !home.newer_cpu_bytes(after,lo,hi).is_empty()
+        {
+            return None;
+        }
+        // SAFETY: the live Shadow owns this mapped staging range.
+        Some(unsafe { self.data.add(lo) } as usize)
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
@@ -4727,6 +4755,7 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        crate::vum::demand::resolve_range(self.start as usize + at, gpu.len());
         let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
@@ -4829,6 +4858,11 @@ impl Shadow {
     /// CPU-publication proof only when none of the bytes were excluded or
     /// missing. The proof is committed by Notes after its journal writes.
     pub(crate) unsafe fn land_home(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes, publication: Option<crate::vum::homes::PublicationEpoch>) -> u64 {
+        if crate::vum::demand::pending() {
+            for &(lo, hi, _) in pieces {
+                crate::vum::demand::resolve_range(self.start as usize + lo, hi.saturating_sub(lo));
+            }
+        }
         let Some(card) = &self.card else {
             return 0;
         };

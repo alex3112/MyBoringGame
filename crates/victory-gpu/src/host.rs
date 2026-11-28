@@ -4319,6 +4319,7 @@ fn late_line(frames: f64) {
     crate::land::log(frames);
     crate::land::gpu_homes_line(frames);
     crate::vum::homes::line(frames);
+    crate::vum::demand::line(frames);
     if relay() {
         release_line(frames);
         let counts = FETCH_COPY_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5352,7 +5353,7 @@ impl Host {
     /// nothing is sent back up. `plans` come with the value signalled behind
     /// their flight. `meanwhile` is called while the fetch is on its way, if
     /// there is one.
-    fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
+    fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut(), other_writes: &[Declared]) {
         use crate::land;
         let gathering = std::time::Instant::now();
         let differs = {
@@ -5443,6 +5444,18 @@ impl Host {
                     (shadow.clone(), lo, lo + len, at)
                 })
                 .collect();
+        }
+        if crate::vum::demand::enabled() && land::on() && !torn::on() && !upcheck::on() {
+            if let Ok(submitted) = self.submitted.try_lock() {
+                let producer = plans.iter().map(|p| p.1).max().unwrap_or(0);
+                if producer != 0 && *submitted == producer
+                    && unsafe { self.fence.GetCompletedValue() } >= producer
+                {
+                    let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+                    crate::vum::demand::defer(self, &self.queue, &mut pieces, producer, behind, other_writes);
+                    total = pieces.iter().map(|(_,lo,hi,_)| (hi-lo) as u64).sum();
+                }
+            }
         }
         land::spent(land::stat::GATHER, gathering);
         if fetch.is_none() {
@@ -5797,7 +5810,7 @@ impl Host {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
-                });
+                }, &back);
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 stage.next("landing: ranges done with");
@@ -6421,6 +6434,37 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::vum::demand::pending() {
+            for list in runs {
+                let deferred = list.deferred();
+                for step in &deferred.copies {
+                    match step {
+                        Step::Refresh(shadow, at, len) => {
+                            crate::vum::demand::resolve_foreign(shadow.id(), *at, *len);
+                        }
+                        Step::GpuWrite(_, at, len) => crate::vum::demand::resolve_range(*at, *len),
+                        Step::Copy(to, from, len) | Step::Fill(to, from, len, _) => {
+                            crate::vum::demand::resolve_range(*from, *len);
+                            crate::vum::demand::resolve_range(*to, *len);
+                        }
+                        Step::Host(_, (from, to)) | Step::Plane((from, to), _) => {
+                            crate::vum::demand::resolve_range(*from, to.saturating_sub(*from));
+                        }
+                        // Texture/placed/opaque callbacks do not yet have a
+                        // complete CPU access contract. Fail open to eager.
+                        Step::Run(_) | Step::Texture(_) | Step::Placed(_) => crate::vum::demand::resolve_all(),
+                    }
+                }
+                for &(at, _, len) in &deferred.writes {
+                    crate::vum::demand::resolve_range(at, len);
+                }
+                for (_, at, [row, rows, pitch]) in &deferred.backs {
+                    crate::vum::demand::resolve_range(*at, rows.saturating_sub(1).saturating_mul(*pitch).saturating_add(*row));
+                }
+                if !deferred.texture_backs.is_empty() { crate::vum::demand::resolve_all(); }
+                if !crate::vum::demand::pending() { break; }
+            }
+        }
         let was_working = working(true);
         if crate::vum::physical_experiment() {
             validate_physical_recordings(runs);
@@ -9385,6 +9429,8 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let _source_access = crate::vum::demand::cpu_access(src as usize, len);
+    let _destination_access = crate::vum::demand::cpu_access(dst as usize, len);
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -9563,6 +9609,8 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let _source_access = crate::vum::demand::cpu_access(src as usize, len);
+    let _destination_access = crate::vum::demand::cpu_access(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {

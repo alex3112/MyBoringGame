@@ -1672,6 +1672,7 @@ pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    let _access = crate::vum::demand::cpu_access(at as usize, len);
     if by_query() {
         return committed_by_query(at, len);
     }
