@@ -1033,6 +1033,8 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let k = (n * PAGE - within).min(data.len() - done);
+        let _access=victory_gpu::vum_physical_access(slice.section.handle as usize,
+            (slice.index*PAGE+within) as u64,k);
         if let Some(at) = slice.section.window(slice.index, *n) {
             // SAFETY: committed bytes of the section's view, which `runs`
             // holds; the title's other uses of them race as on the console.
@@ -1055,6 +1057,8 @@ pub(crate) struct PageWindow {
     view: Window,
     within: usize,
     len: usize,
+    // Outlives decompression into the private section view.
+    _access: victory_gpu::VumCpuAccess,
 }
 
 enum Window {
@@ -1086,6 +1090,8 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let access=victory_gpu::vum_physical_access(slice.section.handle as usize,
+        (slice.index*PAGE+offset%PAGE) as u64,len);
     let view = match slice.section.window(slice.index, *n) {
         Some(at) => Window::Kept(at, slice.section.clone()),
         None => Window::Own(View::map(slice, *n)?),
@@ -1094,6 +1100,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view,
         within: offset % PAGE,
         len,
+        _access: access,
     })
 }
 
@@ -1826,6 +1833,7 @@ fn split(base: usize, len: usize) {
 /// The system calls of [`map`]; `own`: the placeholder at `base` is `len`
 /// long already.
 fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
+    victory_gpu::vum_before_physical_map(slice.section.handle as usize,(slice.index*PAGE) as u64,len);
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {

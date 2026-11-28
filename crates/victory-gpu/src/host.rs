@@ -5454,8 +5454,8 @@ impl Host {
                     let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
                     crate::vum::demand::defer(self, &self.queue, &mut pieces, producer, behind, other_writes);
                     total = pieces.iter().map(|(_,lo,hi,_)| (hi-lo) as u64).sum();
-                }
-            }
+                } else { crate::vum::demand::boundary_missed(); }
+            } else { crate::vum::demand::boundary_missed(); }
         }
         land::spent(land::stat::GATHER, gathering);
         if fetch.is_none() {
@@ -5805,12 +5805,15 @@ impl Host {
                 }
                 let mut hand_back = relay_hand_back(&back);
                 stage.next("landing: copies in the card's memory");
+                let demand_writes:Vec<Declared>=if crate::vum::demand::physical_on() {
+                    flights.iter().flat_map(|f| f.back.iter().cloned()).collect()
+                } else { Vec::new() };
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
-                }, &back);
+                }, if crate::vum::demand::physical_on() { &demand_writes } else { &back });
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 stage.next("landing: ranges done with");
@@ -6447,12 +6450,16 @@ impl Host {
                             crate::vum::demand::resolve_range(*from, *len);
                             crate::vum::demand::resolve_range(*to, *len);
                         }
-                        Step::Host(_, (from, to)) | Step::Plane((from, to), _) => {
+                        Step::Host(_, (from, to)) => {
                             crate::vum::demand::resolve_range(*from, to.saturating_sub(*from));
                         }
-                        // Texture/placed/opaque callbacks do not yet have a
-                        // complete CPU access contract. Fail open to eager.
-                        Step::Run(_) | Step::Texture(_) | Step::Placed(_) => crate::vum::demand::resolve_all(),
+                        Step::Plane((from,len),_) => crate::vum::demand::resolve_range(*from,*len),
+                        Step::Texture(staging) => {
+                            let (at,len)=staging.memory();
+                            crate::vum::demand::resolve_range(at,len);
+                        }
+                        // Opaque callbacks and placed copies still drain.
+                        Step::Run(_) | Step::Placed(_) => crate::vum::demand::resolve_all(),
                     }
                 }
                 for &(at, _, len) in &deferred.writes {

@@ -314,6 +314,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    crate::vum::demand::section_gone(section);
     let (whole, generation) = {
         let mut v = views_mut();
         let generation = v.sections.iter().find(|s| s.0 == section).map(|s| s.3);
@@ -404,6 +405,14 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
         }
     }
     out
+}
+
+/// Whether any registered guest view intersects this CPU access.
+pub(crate) fn has_title_view(at: usize, len: usize) -> bool {
+    if len == 0 { return false; }
+    let v=views();
+    v.views.range(..at.saturating_add(len)).next_back()
+        .is_some_and(|(&base, view)|base.saturating_add(view.0)>at)
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that

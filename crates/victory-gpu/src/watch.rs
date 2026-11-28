@@ -1177,6 +1177,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
     let Some(_reading) = title_memory_reading_now() else {
         return Beside::Cannot;
     };
+    let _access=crate::vum::demand::cpu_access(block * BLOCK,BLOCK);
     let Some((page, shown)) = crate::inplace::beside_page(block * BLOCK) else {
         return Beside::Cannot;
     };
@@ -2193,12 +2194,12 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 
 /// An experimental managed page may be made inaccessible only while
 /// the usual write guard excludes CPU writers and kernel writes.
-pub(crate) fn demand_guard(at: usize, admit: impl FnOnce() -> bool) -> bool {
-    if at % BLOCK != 0 { return false; }
+pub(crate) fn demand_guard_aliases(at: usize, aliases: &[usize], admit: impl FnOnce() -> bool) -> bool {
+    if at % BLOCK != 0 || !aliases.contains(&at) { return false; }
     let g = guards();
     let block = at / BLOCK;
-    g.protected.contains(block) && g.clean.contains(block)
-        && !g.left_alone(block) && !g.aliased.contains(block)
+    g.clean.contains(block)
+        && aliases.iter().all(|&v| v%BLOCK==0 && g.protected.contains(v/BLOCK) && !g.left_alone(v/BLOCK))
         && admit()
 }
 

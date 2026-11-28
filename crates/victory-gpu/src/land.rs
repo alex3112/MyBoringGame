@@ -650,6 +650,7 @@ unsafe fn piece_at(
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+    let _access=crate::vum::demand::cpu_access(title,end);
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);

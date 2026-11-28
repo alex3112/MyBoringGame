@@ -2,7 +2,8 @@
 //! Guest memory and a private writable alias refer to one section. Only
 //! the guest view is protected; the alias lets us publish the complete
 //! GPU page before restoring access, never expose a half-copied page.
-//! No ordinary private memory or remappable pool is admitted.
+//! Ordinary private memory and GPU-imported pools are excluded. The
+//! physical mode uses the existing section registry and all guest aliases.
 //!
 //! The relay may capture pages only at a completed native-queue boundary
 //! with the submission lock held. An immutable local snapshot outlives
@@ -29,11 +30,21 @@ const ALLOC_LIMIT: usize = 64 << 20;
 const SNAP_LIMIT: u64 = 16 << 20;
 const BATCH_PAGES: usize = 64;
 
-pub(crate) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VUM_DEMAND").is_some_and(|v| v == "1"))
-        && !crate::vum::physical_experiment() && crate::inplace::level() == 0
+fn compatible() -> bool {
+    !crate::vum::physical_experiment() && crate::inplace::level() == 0
 }
+
+fn dedicated_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VUM_DEMAND").is_some_and(|v| v == "1")) && compatible()
+}
+
+pub(crate) fn physical_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VUM_PHYSICAL_DEMAND").is_some_and(|v| v == "1")) && compatible()
+}
+
+pub(crate) fn enabled() -> bool { dedicated_on() || physical_on() }
 
 // Exact XMem attribute class must be selected by the operator. Absence of
 // the selector admits no memory: an unobserved CPU read is not proof.
@@ -56,6 +67,13 @@ pub(crate) fn pending() -> bool { PENDING.load(Ordering::Acquire) != 0 }
 static NEXT_ALLOCATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_ACCESS: AtomicU64 = AtomicU64::new(1);
 struct Allocation { id: u64, bytes: usize, alias: usize }
+
+/// Windows handles are reusable; section generation is the identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PhysicalKey { generation: u64, offset: u64 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageIdentity { Dedicated(u64), Physical(PhysicalKey) }
+
 struct Page {
     snapshot: Arc<Snapshot>,
     offset: u64,
@@ -63,12 +81,23 @@ struct Page {
     mirror: usize,
     alias: usize,
     fence: u64,
+    identity: PageIdentity,
+    views: Vec<usize>,
 }
+#[derive(Clone, Copy)]
+enum AccessRange { Virtual(usize,usize), Physical(u64,u64,u64) }
 #[derive(Default)]
 struct State {
     allocations: BTreeMap<usize, Allocation>,
-    active: BTreeMap<u64, (usize,usize)>,
+    active: BTreeMap<u64, AccessRange>,
     pages: BTreeMap<usize, Page>,
+    // One entry per physical page, regardless of how many guest addresses
+    // show it. Virtual aliases index the same live publication.
+    physical: BTreeMap<PhysicalKey, usize>,
+    aliases: BTreeMap<usize, usize>,
+    // A real CPU access makes that physical page a poor lazy candidate.
+    // Fixed upper bound; entries expire after 120 title frames.
+    hot: BTreeMap<PhysicalKey, u64>,
     engine: Option<Engine>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -82,7 +111,7 @@ fn owner(state:&State, at:usize, len:usize) -> Option<(u64,usize)> {
 }
 
 pub fn allocate(size:usize, attributes:u64) -> Option<usize> {
-    if !enabled() || !(MIN..=ALLOC_LIMIT).contains(&size) { return None; }
+    if !dedicated_on() || !(MIN..=ALLOC_LIMIT).contains(&size) { return None; }
     let n=STATS[6].fetch_add(1,Ordering::Relaxed)+1;
     if n <= 16 || n.is_power_of_two() {
         tracing::info!(size,attributes=format_args!("{attributes:#x}"),"VUM demand allocation candidate");
@@ -209,7 +238,7 @@ impl Engine {
     }
     /// Snapshot is complete and immutable. No lock of the normal relay,
     /// submission lane, guards, or resource registry is acquired here.
-    fn publish(&mut self,page:&Page,at:usize)->windows::core::Result<()> {
+    fn publish(&mut self,page:&Page)->windows::core::Result<()> {
         self.sent+=1;
         unsafe {
             self.allocator.Reset()?;
@@ -231,29 +260,59 @@ impl Engine {
             std::ptr::copy_nonoverlapping(data.cast::<u8>(),page.alias as *mut u8,PAGE);
             std::ptr::copy_nonoverlapping(data.cast::<u8>(),page.mirror as *mut u8,PAGE);
             self.buffer.Unmap(0,None);
-            let mut old=0;
-            if mem::VirtualProtect(at as *const _,PAGE,mem::PAGE_READONLY,&mut old)==0 || old!=mem::PAGE_NOACCESS {
-                return Err(windows::core::Error::from_thread());
+            // Publish bytes through the hidden view first; every guest
+            // alias then sees the same complete physical page.
+            for &at in &page.views {
+                let mut old=0;
+                if mem::VirtualProtect(at as *const _,PAGE,mem::PAGE_READONLY,&mut old)==0 || old!=mem::PAGE_NOACCESS {
+                    return Err(windows::core::Error::from_thread());
+                }
             }
         }
         Ok(())
     }
 }
 
-fn resolve_locked(s:&mut State, at:usize,len:usize, except:Option<u64>) -> usize {
-    if len==0 { return 0; }
-    let end=at.saturating_add(len);
-    let first=at/PAGE*PAGE;
-    let keys:Vec<usize>=s.pages.range(first..end).filter(|(_,p)|except!=Some(p.shadow.id())).map(|(&a,_)|a).collect();
-    for a in &keys {
-        let page=s.pages.remove(a).expect("pending page");
-        if let Err(e)=s.engine.as_mut().expect("demand engine").publish(&page,*a) {
-            crate::host::fail(format_args!("VUM demand publication failed at {a:#x}, producer {}: {e}",page.fence));
+fn virtual_keys(s:&State,at:usize,len:usize,except:Option<u64>)->Vec<usize> {
+    if len==0 { return Vec::new(); }
+    let mut keys:Vec<_>=s.aliases.range(at/PAGE*PAGE..at.saturating_add(len))
+        .filter_map(|(_, &key)| s.pages.get(&key).filter(|p|except!=Some(p.shadow.id())).map(|_|key)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+fn physical_keys(s:&State,generation:u64,from:u64,len:u64)->Vec<usize> {
+    if len==0 { return Vec::new(); }
+    let end=from.saturating_add(len);
+    let from=from/PAGE as u64*PAGE as u64;
+    s.physical.range(PhysicalKey{generation,offset:from}..PhysicalKey{generation,offset:end})
+        .map(|(_, &key)|key).collect()
+}
+fn mark_hot(s:&mut State,key:PhysicalKey) {
+    if s.hot.len()>=4096 && !s.hot.contains_key(&key) { s.hot.clear(); }
+    s.hot.insert(key,crate::frame::current() as u64);
+}
+fn materialize(s:&mut State,keys:Vec<usize>,cpu:bool)->usize {
+    let n=keys.len();
+    for at in keys {
+        let page=s.pages.remove(&at).expect("pending page");
+        if let Err(e)=s.engine.as_mut().expect("demand engine").publish(&page) {
+            crate::host::fail(format_args!("VUM demand publication failed at {at:#x}, producer {}: {e}",page.fence));
+        }
+        for view in &page.views { s.aliases.remove(view); }
+        if let PageIdentity::Physical(key)=page.identity {
+            s.physical.remove(&key);
+            PHYSICAL_STATS[3].fetch_add(1,Ordering::Relaxed);
+            if cpu { mark_hot(s,key); }
         }
         PENDING.fetch_sub(1,Ordering::AcqRel);
         STATS[4].fetch_add(PAGE as u64,Ordering::Relaxed);
     }
-    keys.len()
+    n
+}
+fn resolve_locked(s:&mut State, at:usize,len:usize, except:Option<u64>) -> usize {
+    let keys=virtual_keys(s,at,len,except);
+    materialize(s,keys,false)
 }
 
 pub(crate) fn resolve_range(at:usize,len:usize) {
@@ -266,7 +325,7 @@ pub(crate) fn resolve_range(at:usize,len:usize) {
 /// Known kernel reads/copies are leased for the whole call, not merely
 /// checked before it. Admission tests these ranges under the same mutex,
 /// so a page cannot become inaccessible in the middle of a kernel read.
-pub(crate) struct CpuAccess(u64);
+pub struct CpuAccess(u64);
 impl Drop for CpuAccess {
     fn drop(&mut self) {
         if self.0 != 0 {
@@ -277,17 +336,51 @@ impl Drop for CpuAccess {
     }
 }
 pub(crate) fn cpu_access(at:usize,len:usize)->CpuAccess {
-    if len==0 || ALLOC_BYTES.load(Ordering::Acquire)==0 { return CpuAccess(0); }
+    if len==0 || (!physical_on() && ALLOC_BYTES.load(Ordering::Acquire)==0) { return CpuAccess(0); }
     let end=at.saturating_add(len);
+    let mapped=physical_on() && crate::inplace::has_title_view(at,len);
+    if !mapped && ALLOC_BYTES.load(Ordering::Acquire)==0 { return CpuAccess(0); }
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
-    let Some(s)=state.as_mut() else { return CpuAccess(0); };
-    if !s.allocations.range(..end).next_back().is_some_and(|(&base,a)|base.saturating_add(a.bytes)>at) {
+    let s=state.get_or_insert_with(State::default);
+    if !mapped && !s.allocations.range(..end).next_back().is_some_and(|(&base,a)|base.saturating_add(a.bytes)>at) {
         return CpuAccess(0);
     }
-    STATS[3].fetch_add(resolve_locked(s,at,len,None) as u64,Ordering::Relaxed);
+    let keys=virtual_keys(s,at,len,None);
+    STATS[3].fetch_add(materialize(s,keys,true) as u64,Ordering::Relaxed);
     let id=NEXT_ACCESS.fetch_add(1,Ordering::Relaxed);
-    s.active.insert(id,(at,end));
+    s.active.insert(id,AccessRange::Virtual(at,end));
     CpuAccess(id)
+}
+
+/// DirectStorage uses its own writable section view, not a guest alias.
+/// Lease by physical identity, including pages that have no guest view.
+pub fn physical_access(section:usize,offset:u64,len:usize)->CpuAccess {
+    if !physical_on() || len==0 { return CpuAccess(0); }
+    let Some(generation)=crate::inplace::section_generation(section) else { return CpuAccess(0); };
+    let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
+    let s=state.get_or_insert_with(State::default);
+    let keys=physical_keys(s,generation,offset,len as u64);
+    STATS[3].fetch_add(materialize(s,keys,true) as u64,Ordering::Relaxed);
+    let id=NEXT_ACCESS.fetch_add(1,Ordering::Relaxed);
+    s.active.insert(id,AccessRange::Physical(generation,offset,offset.saturating_add(len as u64)));
+    CpuAccess(id)
+}
+
+/// Called before MapViewOfFile3: a new unprotected alias must not expose
+/// stale RAM. The mapping writer excludes new demand admissions.
+pub fn before_physical_map(section:usize,offset:u64,len:usize) {
+    if !pending() || !physical_on() { return; }
+    let Some(generation)=crate::inplace::section_generation(section) else { return; };
+    let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
+    if let Some(s)=state.as_mut() {
+        let keys=physical_keys(s,generation,offset,len as u64);
+        PHYSICAL_STATS[4].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn section_gone(section:usize) {
+    if !pending() || !physical_on() { return; }
+    before_physical_map(section,0,usize::MAX);
 }
 pub(crate) fn resolve_all() { resolve_range(0,usize::MAX); }
 pub(crate) fn resolve_mapping(at:usize,len:usize) {
@@ -297,7 +390,11 @@ pub(crate) fn resolve_foreign(id:u64,at:usize,len:usize) {
     if !pending() || len==0 { return; }
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     if let Some(s)=state.as_mut() {
-        STATS[3].fetch_add(resolve_locked(s,at,len,Some(id)) as u64,Ordering::Relaxed);
+        let mut keys:Vec<_>=s.aliases.range(at/PAGE*PAGE..at.saturating_add(len)).filter_map(|(&a,&primary)| {
+            (a!=primary || s.pages[&primary].shadow.id()!=id).then_some(primary)
+        }).collect();
+        keys.sort_unstable(); keys.dedup();
+        STATS[3].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
     }
 }
 
@@ -305,14 +402,17 @@ pub(crate) fn fault(at:usize,write:bool)->bool {
     if !enabled() { return false; }
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     let Some(s)=state.as_mut() else { return false; };
-    if resolve_locked(s,at,1,None)!=0 {
+    let keys=virtual_keys(s,at,1,None);
+    if materialize(s,keys,true)!=0 {
         STATS[2].fetch_add(1,Ordering::Relaxed);
         return true;
     }
     // A second fault can have been delivered before another thread
     // finished publication. For a write to a restored read-only page,
     // let the normal write-guard handler open it instead.
-    if owner(s,at,1).is_none() { return false; }
+    let dedicated=owner(s,at,1).is_some();
+    drop(state);
+    if !dedicated && (!physical_on() || !crate::inplace::has_title_view(at,1)) { return false; }
     let mut info:mem::MEMORY_BASIC_INFORMATION=unsafe { std::mem::zeroed() };
     let n=unsafe { mem::VirtualQuery(at as *const _,&mut info,std::mem::size_of_val(&info)) };
     n!=0 && info.State==mem::MEM_COMMIT && (info.Protect==mem::PAGE_READWRITE || !write && info.Protect==mem::PAGE_READONLY)
@@ -332,11 +432,11 @@ pub(crate) fn refresh_covered(id:u64,from:usize,to:usize)->Option<bool> {
     if !pending() || from>=to { return None; }
     let state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     let s=state.as_ref()?;
-    let mut pages=s.pages.range(from/PAGE*PAGE..to).peekable();
+    let mut pages=s.aliases.range(from/PAGE*PAGE..to).peekable();
     pages.peek()?;
     let mut at=from;
-    for (&a,p) in pages {
-        if a>at || p.shadow.id()!=id { return Some(false); }
+    for (&a,&primary) in pages {
+        if a>at || a!=primary || s.pages[&primary].shadow.id()!=id { return Some(false); }
         at=at.max(a+PAGE);
     }
     let all=at>=to;
@@ -348,48 +448,100 @@ pub(crate) fn refresh_gaps(id:u64,from:usize,to:usize)->Option<Vec<(usize,usize)
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     let s=state.as_mut()?;
     let first=from/PAGE*PAGE;
-    if s.pages.range(first..to).next().is_none() { return None; }
-    STATS[3].fetch_add(resolve_locked(s,from,to-from,Some(id)) as u64,Ordering::Relaxed);
-    let out=gaps(from,to,s.pages.range(first..to).map(|(&a,_)|a));
+    if s.aliases.range(first..to).next().is_none() { return None; }
+    // Only the original native allocation can skip a RAM refresh. Another
+    // GPU Shadow, including one for an alias, must first publish.
+    let mut keys:Vec<_>=s.aliases.range(first..to).filter_map(|(&a,&primary)| {
+        (a!=primary || s.pages[&primary].shadow.id()!=id).then_some(primary)
+    }).collect();
+    keys.sort_unstable(); keys.dedup();
+    STATS[3].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
+    let out=gaps(from,to,s.aliases.range(first..to).map(|(&a,_)|a));
     STATS[5].fetch_add(1,Ordering::Relaxed);
     Some(out)
 }
 
-fn admit(shadow:Arc<Shadow>,lo:usize,mirror:usize,snapshot:Arc<Snapshot>,offset:u64,fence:u64,allocation:u64)->bool {
-    let at=shadow.span().0 as usize+lo;
-    let admitted=crate::watch::demand_guard(at,|| {
+static PHYSICAL_STATS:[AtomicU64;7]=[const{AtomicU64::new(0)};7];
+static GUARD_REFUSALS:AtomicU64=AtomicU64::new(0);
+// candidate pages, admitted physical pages, hot refusals, materialized,
+// published before mapping, missed submission boundary, other refusals.
+pub(crate) fn boundary_missed() {
+    if physical_on() { PHYSICAL_STATS[5].fetch_add(1,Ordering::Relaxed); }
+}
+fn active(s:&State,identity:PageIdentity,views:&[usize])->bool {
+    s.active.values().any(|access|match *access {
+        AccessRange::Virtual(a,b)=>views.iter().any(|&v|a<v+PAGE&&v<b),
+        AccessRange::Physical(g,a,b)=>matches!(identity,PageIdentity::Physical(k)
+            if k.generation==g && a<k.offset+PAGE as u64 && k.offset<b),
+    })
+}
+struct Candidate {
+    i:usize, shadow:Arc<Shadow>, lo:usize, mirror:usize,
+    identity:PageIdentity, views:Vec<usize>,
+}
+fn admit(c:Candidate,snapshot:Arc<Snapshot>,offset:u64,fence:u64)->bool {
+    let at=c.shadow.span().0 as usize+c.lo;
+    // The caller holds MAPPING's read lock, so the complete alias list and
+    // section generation cannot change until admission and journal finish.
+    let physical_alias=match c.identity {
+        PageIdentity::Physical(_)=>crate::inplace::beside(at,PAGE),
+        PageIdentity::Dedicated(_)=>None,
+    };
+    let admitted=crate::watch::demand_guard_aliases(at,&c.views,|| {
         let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
         let Some(s)=state.as_mut() else { return false; };
-        let Some((id,alias))=owner(s,at,PAGE) else { return false; };
-        if id!=allocation || s.engine.is_none() || s.pages.contains_key(&at)
-            || s.active.values().any(|&(a,b)|a<at+PAGE&&at<b)
-        { return false; }
-        let mut info:mem::MEMORY_BASIC_INFORMATION=unsafe{std::mem::zeroed()};
-        let n=unsafe{mem::VirtualQuery(at as *const _,&mut info,std::mem::size_of_val(&info))};
-        if n==0 || info.State!=mem::MEM_COMMIT || info.Type!=mem::MEM_MAPPED || info.Protect!=mem::PAGE_READONLY
-            || (info.BaseAddress as usize).saturating_add(info.RegionSize)<at+PAGE { return false; }
-        // The ordinary guard excludes CPU stores here. Require every
-        // reference byte to agree with the alias before taking the page.
-        // No driver-imported memory, no address guessed from traffic.
-        let same=unsafe { std::slice::from_raw_parts(alias as *const u8,PAGE)==std::slice::from_raw_parts(mirror as *const u8,PAGE) };
+        let alias=match c.identity {
+            PageIdentity::Dedicated(allocation)=>{
+                let Some((id,alias))=owner(s,at,PAGE) else { return false; };
+                if id!=allocation { return false; }
+                alias
+            }
+            PageIdentity::Physical(key)=>{
+                if s.physical.contains_key(&key) { return false; }
+                let Some(alias)=physical_alias else { return false; };
+                alias
+            }
+        };
+        if s.engine.is_none() || c.views.iter().any(|v|s.aliases.contains_key(v)) || active(s,c.identity,&c.views) { return false; }
+        for &v in &c.views {
+            let mut info:mem::MEMORY_BASIC_INFORMATION=unsafe{std::mem::zeroed()};
+            let n=unsafe{mem::VirtualQuery(v as *const _,&mut info,std::mem::size_of_val(&info))};
+            if n==0 || info.State!=mem::MEM_COMMIT || info.Type!=mem::MEM_MAPPED || info.Protect!=mem::PAGE_READONLY
+                || (info.BaseAddress as usize).saturating_add(info.RegionSize)<v+PAGE { return false; }
+        }
+        // Every guest alias is guarded, and both virtual and hidden
+        // physical accesses are leased. The reference must match all bytes.
+        let same=unsafe { std::slice::from_raw_parts(alias as *const u8,PAGE)==std::slice::from_raw_parts(c.mirror as *const u8,PAGE) };
         if !same { return false; }
-        let mut old=0;
-        // Advertise pending before protecting, while STATE is held.
-        // A fault arriving before insertion waits on this same lock.
         PENDING.fetch_add(1,Ordering::AcqRel);
-        if unsafe{mem::VirtualProtect(at as *const _,PAGE,mem::PAGE_NOACCESS,&mut old)}==0 {
-            PENDING.fetch_sub(1,Ordering::AcqRel);return false;
+        let mut protected=Vec::new();
+        for &v in &c.views {
+            let mut old=0;
+            let changed=unsafe{mem::VirtualProtect(v as *const _,PAGE,mem::PAGE_NOACCESS,&mut old)}!=0;
+            if !changed || old!=mem::PAGE_READONLY {
+                if changed && unsafe{mem::VirtualProtect(v as *const _,PAGE,old,&mut old)}==0 {
+                    crate::host::fail(format_args!("VUM demand alias rollback failed"));
+                }
+                for v in protected {
+                    if unsafe{mem::VirtualProtect(v as *const _,PAGE,mem::PAGE_READONLY,&mut old)}==0 {
+                        crate::host::fail(format_args!("VUM demand alias rollback failed"));
+                    }
+                }
+                PENDING.fetch_sub(1,Ordering::AcqRel);
+                return false;
+            }
+            protected.push(v);
         }
-        if old!=mem::PAGE_READONLY {
-            unsafe{mem::VirtualProtect(at as *const _,PAGE,old,&mut old)};
-            PENDING.fetch_sub(1,Ordering::AcqRel);return false;
+        for &v in &c.views { s.aliases.insert(v,at); }
+        if let PageIdentity::Physical(key)=c.identity {
+            s.physical.insert(key,at);
+            PHYSICAL_STATS[1].fetch_add(1,Ordering::Relaxed);
         }
-        s.pages.insert(at,Page{snapshot,offset,shadow,mirror,alias,fence});
+        s.pages.insert(at,Page{snapshot,offset,shadow:c.shadow.clone(),mirror:c.mirror,alias,fence,
+            identity:c.identity,views:c.views.clone()});
         true
     });
     if admitted {
-        // Logical write is visible now, even while physical bytes are in
-        // VRAM. Other copies see the journal, resolve on access and refresh.
         let pages:Vec<usize>=(at/4096..(at+PAGE)/4096).collect();
         crate::watch::landed_beside(&pages,&[(at,PAGE)]);
     }
@@ -397,50 +549,80 @@ fn admit(shadow:Arc<Shadow>,lo:usize,mirror:usize,snapshot:Arc<Snapshot>,offset:
 }
 
 pub(crate) fn defer(host:&Host, queue:&ID3D12CommandQueue,pieces:&mut Vec<Piece>,fence:u64,after:u64,other:&[(Arc<Shadow>,Vec<(usize,usize)>)]) {
-    if ALLOC_BYTES.load(Ordering::Acquire)==0 || pieces.is_empty() { return; }
-    // One bounded batch. Keep the original eager path for partial pages,
-    // multiple writers/aliases, newer CPU bytes, budget/guard failures.
+    if (!physical_on() && ALLOC_BYTES.load(Ordering::Acquire)==0) || pieces.is_empty() { return; }
+    // Never block the relay behind a mapping writer. Holding this through
+    // admission pins the section and every alias, not just one address.
+    let Some(_mapping)=crate::watch::title_memory_reading_now() else { boundary_missed(); return; };
     let mut candidates=Vec::new();
     {
         let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
-        let Some(s)=state.as_mut() else { return; };
+        let s=state.get_or_insert_with(State::default);
         if s.engine.is_none() { s.engine=Engine::new(host); }
         if s.engine.is_none() { return; }
         for (i,(shadow,lo,hi,_)) in pieces.iter().enumerate() {
             let at=shadow.span().0 as usize+*lo;
-            let Some((allocation,_))=owner(s,at,PAGE) else { continue; };
-            if s.pages.contains_key(&at) || s.active.values().any(|&(a,b)|a<at+PAGE&&at<b) { continue; }
             let Some(mirror)=shadow.demand_mirror(*lo,*hi,after) else { continue; };
-            let end=at+PAGE;
-            if other.iter().any(|(_,ranges)|ranges.iter().any(|&(a,b)|a<end&&at<b))
+            let (identity,views)=if let Some((allocation,_))=owner(s,at,PAGE) {
+                (PageIdentity::Dedicated(allocation),vec![at])
+            } else if physical_on() {
+                let Some(run)=crate::inplace::physical_run(at,PAGE) else { continue; };
+                // SEC_COMMIT sections include VUM1's imported GPU heaps.
+                // Admit only the original SEC_RESERVE physical pools.
+                if run.committed || run.offset % PAGE as u64 != 0 { continue; }
+                let key=PhysicalKey{generation:run.generation,offset:run.offset};
+                let mut aliases=crate::inplace::pages_of(at);
+                aliases.sort_unstable(); aliases.dedup();
+                // Do not truncate an alias set, or protect unknown views.
+                if aliases.is_empty() || aliases.len()>crate::watch::MANY_VIEWS || !aliases.contains(&at) { continue; }
+                PHYSICAL_STATS[0].fetch_add(1,Ordering::Relaxed);
+                if s.hot.get(&key).is_some_and(|&f| (crate::frame::current() as u64).saturating_sub(f)<120) {
+                    PHYSICAL_STATS[2].fetch_add(1,Ordering::Relaxed); continue;
+                }
+                if s.physical.contains_key(&key) { continue; }
+                (PageIdentity::Physical(key),aliases)
+            } else { continue; };
+            if views.iter().any(|v|s.aliases.contains_key(v)) || active(s,identity,&views) { continue; }
+            // Detect producers through all guest aliases, not just the
+            // virtual address which was used by the winning Shadow.
+            if views.iter().any(|&v|other.iter().any(|(s,ranges)|s.id()!=shadow.id()
+                    && ranges.iter().any(|&(a,b)|a<v+PAGE&&v<b))
                 || pieces.iter().enumerate().any(|(j,(other,a,b,_))|j!=i
-                    && (other.span().0 as usize+*a)<end && at<other.span().0 as usize+*b)
-            { continue; }
-            candidates.push((i,shadow.clone(),*lo,mirror,allocation));
+                    && (other.span().0 as usize+*a)<v+PAGE && v<other.span().0 as usize+*b))
+            { PHYSICAL_STATS[6].fetch_add(1,Ordering::Relaxed); continue; }
+            candidates.push(Candidate{i,shadow:shadow.clone(),lo:*lo,mirror,identity,views});
             if candidates.len()>=BATCH_PAGES { break; }
         }
     }
+    // Avoid allocating/copying a snapshot for pages already known not to
+    // have a complete clean guard. Recheck under the lock at admission.
+    let before=candidates.len();
+    candidates.retain(|c|crate::watch::demand_guard_aliases(c.shadow.span().0 as usize+c.lo,&c.views,||true));
+    GUARD_REFUSALS.fetch_add((before-candidates.len()) as u64,Ordering::Relaxed);
     if candidates.is_empty() { return; }
-    let selected:Vec<_>=candidates.iter().map(|(_,s,lo,_,_)|(s.clone(),*lo)).collect();
+    let selected:Vec<_>=candidates.iter().map(|c|(c.shadow.clone(),c.lo)).collect();
     let bytes=(selected.len()*PAGE) as u64;
     let Some(snapshot)=capture(host,queue,&selected,bytes) else { STATS[7].fetch_add(candidates.len() as u64,Ordering::Relaxed); return; };
     let mut taken=Vec::new();
-    for (n,(i,shadow,lo,mirror,allocation)) in candidates.into_iter().enumerate() {
-        if admit(shadow,lo,mirror,snapshot.clone(),(n*PAGE) as u64,fence,allocation) {
+    for (n,c) in candidates.into_iter().enumerate() {
+        let i=c.i;
+        if admit(c,snapshot.clone(),(n*PAGE) as u64,fence) {
             taken.push(i);
             STATS[0].fetch_add(1,Ordering::Relaxed);
             STATS[1].fetch_add(PAGE as u64,Ordering::Relaxed);
         } else { STATS[7].fetch_add(1,Ordering::Relaxed); }
     }
-    // Preserve the original order of every remaining eager writeback.
     let mut i=0;
     pieces.retain(|_|{let keep=taken.binary_search(&i).is_err();i+=1;keep});
 }
 
 pub(crate) fn line(frames:f64) {
+    let [candidates,admitted,hot,materialized,mapped,boundary,other]=PHYSICAL_STATS.each_ref().map(|n|n.swap(0,Ordering::Relaxed) as f64/frames.max(1.0));
+    tracing::info!("VUM physical demand (VICTORY_VUM_PHYSICAL_DEMAND={}): {:.1} candidates, {:.1} admitted, {:.1} hot refusals, {:.1} materialized, {:.1} before new mapping, {:.1} missed boundaries, {:.1} conflicting producers, {:.1} guard refusals/frame",
+        u8::from(physical_on()),candidates,admitted,hot,materialized,mapped,boundary,other,
+        GUARD_REFUSALS.swap(0,Ordering::Relaxed) as f64/frames.max(1.0));
     let [a,b,f,e,m,r,c,x]=STATS.each_ref().map(|n|n.swap(0,Ordering::Relaxed) as f64/frames.max(1.0));
     tracing::info!("VUM demand (VICTORY_VUM_DEMAND={}): {:.1} pages deferred/frame, {:.3} MiB deferred, {:.1} CPU faults, {:.1} forced publications, {:.3} MiB materialized, {:.1} same-home refresh decisions, {:.1} allocation candidates, {:.1} refused; {} pending pages, {:.2} MiB snapshots, {:.2} MiB managed RAM",
-        u8::from(enabled()),a,b/1048576.0,f,e,m/1048576.0,r,c,x,PENDING.load(Ordering::Acquire),
+        u8::from(dedicated_on()),a,b/1048576.0,f,e,m/1048576.0,r,c,x,PENDING.load(Ordering::Acquire),
         SNAP_BYTES.load(Ordering::Acquire) as f64/1048576.0,ALLOC_BYTES.load(Ordering::Acquire) as f64/1048576.0);
 }
 
@@ -451,6 +633,20 @@ mod tests {
         assert_eq!(gaps(PAGE/2,4*PAGE,[PAGE,2*PAGE].into_iter()),[(PAGE/2,PAGE),(3*PAGE,4*PAGE)]);
         assert!(gaps(PAGE+1,2*PAGE,[PAGE].into_iter()).is_empty());
         assert_eq!(gaps(0,4*PAGE,[PAGE,3*PAGE].into_iter()),[(0,PAGE),(2*PAGE,3*PAGE)]);
+    }
+    #[test] fn physical_identity_and_exact_ranges() {
+        let mut s=State::default();
+        s.physical.insert(PhysicalKey{generation:7,offset:0},10*PAGE);
+        s.physical.insert(PhysicalKey{generation:7,offset:PAGE as u64},20*PAGE);
+        s.physical.insert(PhysicalKey{generation:8,offset:0},30*PAGE);
+        assert_eq!(physical_keys(&s,7,PAGE as u64-1,2),vec![10*PAGE,20*PAGE]);
+        assert_eq!(physical_keys(&s,7,0,PAGE as u64),vec![10*PAGE]);
+        assert_eq!(physical_keys(&s,8,0,1),vec![30*PAGE]);
+        s.active.insert(1,AccessRange::Physical(7,1,2));
+        assert!(active(&s,PageIdentity::Physical(PhysicalKey{generation:7,offset:0}),&[10*PAGE,20*PAGE]));
+        assert!(!active(&s,PageIdentity::Physical(PhysicalKey{generation:8,offset:0}),&[30*PAGE]));
+        s.active.insert(2,AccessRange::Virtual(20*PAGE+3,20*PAGE+4));
+        assert!(active(&s,PageIdentity::Physical(PhysicalKey{generation:8,offset:0}),&[10*PAGE,20*PAGE]));
     }
     #[test] fn owner_excludes_header_crossings_and_outside() {
         let mut s=State::default();
