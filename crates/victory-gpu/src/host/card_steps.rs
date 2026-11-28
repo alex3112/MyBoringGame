@@ -690,6 +690,13 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        // A shared backing is not a stale RAM mirror that can be filled
+        // through a carded copy. Keep the existing wait for CPU consumers
+        // of a VUM write; never promote that dependency by guessing.
+        let shared = crate::vum::intersections(&written);
+        if !shared.is_empty() && blocked_by(&shared, runs, false).is_some() {
+            return None;
+        }
         blocked_by(&written, runs, false)?;
         let taken = if copied_read(&copies, runs) {
             Err("a copy done on the card is read through another host copy")

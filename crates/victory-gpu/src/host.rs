@@ -1152,6 +1152,10 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+pub(crate) fn existing_host() -> Option<&'static Host> {
+    HOST.get().and_then(Option::as_ref)
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
@@ -2721,6 +2725,8 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: ByCopy<RefreshCoverage>,
+    // Direct shared allocations need lifetime retention, not refresh steps.
+    vum_held: ByCopy<std::sync::Arc<crate::shadow::Shadow>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2815,6 +2821,11 @@ static ACCESS_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::ato
 
 fn record_refresh(deferred: &mut Deferred, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
     let key = std::sync::Arc::as_ptr(shadow) as usize;
+    if shadow.vum() {
+        deferred.vum_held.entry(key).or_insert_with(|| shadow.clone());
+        crate::vum::refresh_omitted(len);
+        return;
+    }
     let Some(end) = address.checked_add(len) else { return };
     if deferred.refreshed.entry(key).or_default().remember(address, end) {
         deferred.copies.push(Step::Refresh(shadow.clone(), address, len));
@@ -3619,6 +3630,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 },
+                Step::Refresh(shadow, at, len) if !shadow.vum()
+                    && touches(written, *at, at.saturating_add(*len))
+                    && crate::vum::overlaps(*at, at.saturating_add(*len)) => return Some(WHY_READ),
+                Step::Host(_, (from, to)) if touches(written, *from, *to)
+                    && crate::vum::overlaps(*from, *to) => return Some(WHY_READ),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
@@ -4107,7 +4123,7 @@ struct RelayBack {
 fn relay_hand_back(back: &[Declared]) -> RelayBack {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.vum() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4293,6 +4309,7 @@ fn late_line(frames: f64) {
     crate::shadow::dirty_card_line(frames);
     crate::shadow::backing_line(frames);
     crate::shadow::versioned_line(frames);
+    crate::vum::log(frames);
     card_steps::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -4525,7 +4542,7 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            if shadow.carded() || shadow.vum() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -4556,8 +4573,8 @@ fn hand_back(back: &[Declared]) {
         return;
     }
     for (shadow, declared) in back {
-        if shadow.carded() {
-            // Done before (`Host::card_back`).
+        if shadow.carded() || shadow.vum() {
+            // Carded copies were merged already; VUM publishes visibility only.
             shadow.copy_back_done(declared);
             continue;
         }

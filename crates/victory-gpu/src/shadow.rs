@@ -102,6 +102,7 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    vum: Option<Arc<crate::vum::Backing>>,
 }
 
 /// The live GPU-write ownership of one native allocation. The exact
@@ -2881,7 +2882,9 @@ impl Drop for Shadow {
         }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            if self.vum.is_none() {
+                crate::inplace::gone(self.window, self.len);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -3356,6 +3359,17 @@ impl Shadow {
         self.place.is_some()
     }
 
+    pub(crate) fn vum(&self) -> bool {
+        self.vum.is_some()
+    }
+
+    fn shared(start: u64, len: u64, window: bool) -> Option<Self> {
+        let (placed, backing) = crate::vum::place_for(start, len)?;
+        let mut shadow = Self::placed(placed, start, len, window);
+        shadow.vum = Some(backing);
+        Some(shadow)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -3396,7 +3410,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        let write = write && self.place.is_none();
+        let write = write && (self.place.is_none() || self.vum());
         if write { self.written.store(true, Ordering::Relaxed); }
         list.defer_access(self, address as usize, len as usize, write);
     }
@@ -3441,6 +3455,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            vum: None,
         }
     }
 
@@ -3466,7 +3481,7 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() && !self.vum() {
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -3806,6 +3821,10 @@ impl Shadow {
     /// those of one of them (each once), and a range is done with when the
     /// last submission that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
+        if let Some(backing) = &self.vum {
+            crate::vum::landed(backing, ranges);
+            return;
+        }
         if self.place.is_some() {
             return;
         }
@@ -5277,6 +5296,7 @@ mod land_tests {
 // the arrival of another containing window. Weak entries do not extend
 // resource lifetime; the Shadow ID prevents removal of a reused key.
 type NativeBacking = (u64, std::sync::Weak<Shadow>);
+static VUM_BACKINGS: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, Vec<NativeBacking>>>> = std::sync::OnceLock::new();
 const BACKING_SHARDS: usize = 64;
 static NATIVE_BACKINGS: std::sync::OnceLock<[Mutex<std::collections::HashMap<usize, NativeBacking>>; BACKING_SHARDS]> = std::sync::OnceLock::new();
 static BACKING_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -5295,7 +5315,10 @@ fn native_key(buffer: &ID3D12Resource) -> usize {
 
 fn publish_shadow(shadow: Shadow) -> Arc<Shadow> {
     let shadow = Arc::new(shadow);
-    if unified_backing() {
+    if shadow.vum() {
+        VUM_BACKINGS.get_or_init(|| Mutex::default()).lock().unwrap_or_else(|e| e.into_inner())
+            .entry(native_key(&shadow.buffer)).or_default().push((shadow.id(), Arc::downgrade(&shadow)));
+    } else if unified_backing() {
         let key = native_key(&shadow.buffer);
         let shards = NATIVE_BACKINGS.get_or_init(|| std::array::from_fn(|_| Mutex::default()));
         shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner())
@@ -5305,6 +5328,17 @@ fn publish_shadow(shadow: Shadow) -> Arc<Shadow> {
 }
 
 fn forget_native(shadow: &Shadow) {
+    if shadow.vum() {
+        if let Some(all) = VUM_BACKINGS.get() {
+            let mut map = all.lock().unwrap_or_else(|e| e.into_inner());
+            let key = native_key(&shadow.buffer);
+            if let Some(views) = map.get_mut(&key) {
+                views.retain(|(id,_)| *id != shadow.id());
+                if views.is_empty() { map.remove(&key); }
+            }
+        }
+        return;
+    }
     if let Some(shards) = NATIVE_BACKINGS.get() {
         let key = native_key(&shadow.buffer);
         let mut map = shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
@@ -5318,11 +5352,20 @@ fn forget_native(shadow: &Shadow) {
 /// a different copy merely because it now contains the same guest range.
 pub(crate) fn native_backing(buffer: &ID3D12Resource, address: u64, len: u64) -> Option<Arc<Shadow>> {
     let key = native_key(buffer);
-    let shards = NATIVE_BACKINGS.get()?;
-    let shadow = {
+    let shadow = NATIVE_BACKINGS.get().and_then(|shards| {
         let map = shards[backing_shard(key)].lock().unwrap_or_else(|e| e.into_inner());
-        map.get(&key)?.1.upgrade()?
-    };
+        map.get(&key)?.1.upgrade()
+    }).or_else(|| {
+        // Clone weak identities before upgrading: a final Arc's Drop
+        // must never run while holding its identity registry lock.
+        let candidates = VUM_BACKINGS.get()?.lock().unwrap_or_else(|e| e.into_inner())
+            .get(&key)?.clone();
+        candidates.into_iter().filter_map(|(_,w)| w.upgrade())
+            .filter(|s| {
+                let (at,n) = s.span();
+                address >= at && address.checked_add(len).is_some_and(|end| end <= at + n)
+            }).min_by_key(|s| s.span().1)
+    })?;
     let (start, width) = shadow.span();
     if address < start || address.checked_add(len)? > start.checked_add(width)? {
         return None;
@@ -5455,8 +5498,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .range(..(end, 0))
+            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at
+                && (shadow.vum() || key.0 >= at.saturating_sub(WINDOW)))
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
@@ -5464,8 +5508,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+        for (i, (_, entry)) in map.range_mut(..(end, 0)).rev().enumerate() {
+            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some() && (s.vum() || i < 256)) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -5608,6 +5652,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
+        // A dedicated VUM section is already the native backing. Keep
+        // the logical buffer's original bounds, even if the native heap
+        // spans a larger allocation.
+        if let Some(shared) = Shadow::shared(key.0, len, false) {
+            entry.shadow = Some(publish_shadow(shared));
+            return entry.shadow.clone();
+        }
         let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(publish_shadow(Shadow::placed(placed, key.0, len, false)));
@@ -5822,6 +5873,9 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    if let Some(shared) = Shadow::shared(start, len, true) {
+        return Some(publish_shadow(shared));
+    }
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -6023,6 +6077,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    if let Some(shared) = Shadow::shared(start, len, true) {
+        let shadow = publish_shadow(shared);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.

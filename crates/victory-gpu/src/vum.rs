@@ -1,0 +1,222 @@
+//! VUM 1: a dedicated XMem allocation backed by one committed section.
+//! The CPU mapping and a single native buffer use the same physical pages.
+//! Logical buffers/windows retain their bounds and share the native buffer.
+//! No address-opened heap or remappable page-pool view is admitted here.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use windows::Win32::Graphics::Direct3D12::*;
+use windows_sys::Win32::System::Memory as mem;
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+
+const PAGE: usize = 64 << 10;
+const MIN: usize = 1 << 20;
+const MAX: usize = 64 << 20;
+const LIMIT: u64 = 256 << 20;
+
+static NEXT: AtomicU64 = AtomicU64::new(1);
+static CHARGED: AtomicU64 = AtomicU64::new(0);
+static LIVE: AtomicU64 = AtomicU64::new(0);
+static COUNT: AtomicU64 = AtomicU64::new(0);
+// allocation attempts, admitted, driver refusals, binding views,
+// eliminated refresh requests and their logical bytes, published ranges.
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+pub(crate) struct Backing {
+    pub(crate) id: u64,
+    pub(crate) base: usize,
+    bytes: usize,
+    heap: ID3D12Heap,
+    buffer: ID3D12Resource,
+    gpu: u64,
+}
+impl Drop for Backing {
+    fn drop(&mut self) {
+        CHARGED.fetch_sub(self.bytes as u64, Relaxed);
+    }
+}
+
+struct Allocation {
+    handle: usize,
+    backing: Arc<Backing>,
+    // Original XMem attributes, not guessed host memory permissions.
+    attributes: u64,
+}
+
+static ALLOCATIONS: Mutex<BTreeMap<usize, Allocation>> = Mutex::new(BTreeMap::new());
+
+fn enabled() -> bool {
+    crate::toggled!("VICTORY_VUM")
+}
+
+fn capacity() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("VICTORY_VUM_MB").ok()
+        .and_then(|v| v.parse::<u64>().ok()).map(|v| v.min(1024) << 20).unwrap_or(LIMIT))
+}
+
+/// No GPU initialization from a title allocator: only use an existing host.
+/// If any operation fails, nothing is published and the caller uses its
+/// old private allocation path.
+pub fn allocate(size: usize, attributes: u64) -> Option<usize> {
+    if !enabled() || !(MIN..=MAX).contains(&size) { return None; }
+    let bytes = size.checked_next_multiple_of(PAGE)?;
+    if bytes > MAX { return None; }
+    STATS[0].fetch_add(1, Relaxed);
+    let host = crate::host::existing_host()?;
+    CHARGED.fetch_update(Relaxed, Relaxed, |n| n.checked_add(bytes as u64).filter(|&v| v <= capacity())).ok()?;
+    let make = || -> Option<(usize, usize, ID3D12Heap, ID3D12Resource)> {
+        let handle = unsafe { mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+            mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null()) };
+        if handle.is_null() { return None; }
+        let base = unsafe { mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, 0, bytes) }.Value as usize;
+        if base == 0 {
+            unsafe { CloseHandle(handle); }
+            return None;
+        }
+        let native = crate::inplace::open(&host.device, crate::inplace::From::Section(handle as usize))
+            .and_then(|heap| crate::inplace::place(&host.device, &heap, 0, bytes as u64).map(|buffer| (heap, buffer)));
+        match native {
+            Ok((heap, buffer)) => Some((base, handle as usize, heap, buffer)),
+            Err(e) => {
+                if STATS[2].fetch_add(1, Relaxed) == 0 {
+                    tracing::warn!(error = %e, "VUM: driver refused section backing; legacy allocation");
+                }
+                unsafe {
+                    mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ });
+                    CloseHandle(handle);
+                }
+                None
+            }
+        }
+    };
+    let Some((base, handle, heap, buffer)) = make() else {
+        CHARGED.fetch_sub(bytes as u64, Relaxed);
+        return None;
+    };
+    let id = NEXT.fetch_add(1, Relaxed);
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    crate::host::name(&buffer, || format!("VUM section {id} ({bytes:#x} bytes)"));
+    let backing = Arc::new(Backing { id, base, bytes, heap, buffer, gpu });
+    // Register the CPU mapping with existing alias-aware guards so that a
+    // legacy texture or crossing view can still observe updates.
+    {
+        let _mapping = crate::watch::title_memory_remapping();
+        crate::watch::title_memory_remapped(base, bytes);
+        crate::inplace::title_memory_section(handle, bytes as u64, true);
+        crate::inplace::title_memory_view(base, bytes, handle, 0);
+        ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(base, Allocation { handle, backing, attributes });
+        LIVE.fetch_add(bytes as u64, Relaxed);
+        COUNT.fetch_add(1, Relaxed);
+    }
+    STATS[1].fetch_add(1, Relaxed);
+    tracing::info!(id, base = format_args!("{base:#x}"), bytes, attributes = format_args!("{attributes:#x}"), "VUM: dedicated shared allocation");
+    Some(base)
+}
+
+/// Release the CPU view. The native heap is retained by recorded lists,
+/// and the section remains alive through their native references.
+pub fn release(base: usize) -> bool {
+    let _mapping = crate::watch::title_memory_remapping();
+    let allocation = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&base);
+    let Some(allocation) = allocation else { return false; };
+    let bytes = allocation.backing.bytes;
+    crate::watch::title_memory_unmapping(base, bytes);
+    crate::shadow::in_place_let_go(base as u64, bytes as u64);
+    let unmapped = unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
+    if unmapped == 0 {
+        // Keep ownership rather than closing a section still mapped.
+        crate::inplace::title_memory_view(base, bytes, allocation.handle, 0);
+        ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(base, allocation);
+        tracing::error!(base, "VUM: unable to unmap dedicated allocation");
+        return false;
+    }
+    crate::inplace::title_memory_section_gone(allocation.handle);
+    unsafe { CloseHandle(allocation.handle as _); }
+    LIVE.fetch_sub(bytes as u64, Relaxed);
+    COUNT.fetch_sub(1, Relaxed);
+    tracing::debug!(id = allocation.backing.id, attributes = format_args!("{:#x}", allocation.attributes), "VUM: CPU view released");
+    crate::host::retire(allocation.backing);
+    true
+}
+
+pub(crate) fn place_for(start: u64, len: u64) -> Option<(crate::inplace::Placed, Arc<Backing>)> {
+    if COUNT.load(Relaxed) == 0 || len == 0 { return None; }
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    let backing = {
+        let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let (&base, a) = map.range(..=start).next_back()?;
+        if end > base.checked_add(a.backing.bytes)? { return None; }
+        a.backing.clone()
+    };
+    let bias = (start - backing.base) as u64;
+    let placed = crate::inplace::Placed { buffer: backing.buffer.clone(), heap: backing.heap.clone(),
+        gpu: backing.gpu + bias, bias };
+    STATS[3].fetch_add(1, Relaxed);
+    Some((placed, backing))
+}
+
+pub(crate) fn overlaps(from: usize, to: usize) -> bool {
+    if from >= to || COUNT.load(Relaxed) == 0 { return false; }
+    let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    map.range(..to).next_back().is_some_and(|(&base,a)| base + a.backing.bytes > from)
+}
+
+pub(crate) fn intersections(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if COUNT.load(Relaxed) == 0 { return Vec::new(); }
+    let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut result = Vec::new();
+    for &(from,to) in ranges {
+        if from >= to { continue; }
+        let first = map.range(..=from).next_back().map(|(&base,_)| base).unwrap_or(from);
+        for (&base,a) in map.range(first..to) {
+            let at = base.max(from);
+            let end = (base + a.backing.bytes).min(to);
+            if at < end { result.push((at,end)); }
+        }
+    }
+    result.sort_unstable();
+    result
+}
+
+pub(crate) fn refresh_omitted(len: usize) {
+    STATS[4].fetch_add(1, Relaxed);
+    STATS[5].fetch_add(len as u64, Relaxed);
+}
+
+/// Called only after the actual native fence completes, before publishing
+/// the guest fence. The bytes are already in the CPU mapping; only old
+/// fallback copies/texture views need a journal notification. Never mark
+/// a recycled virtual address from an old flight.
+pub(crate) fn landed(backing: &Backing, ranges: &[(usize, usize)]) {
+    let _mapping = crate::watch::title_memory_reading();
+    let current = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&backing.base).is_some_and(|a| a.backing.id == backing.id);
+    if !current { return; }
+    let mut spans = ranges.to_vec();
+    spans.sort_unstable();
+    let mut joined: Vec<(usize,usize)> = Vec::new();
+    for (from,to) in spans {
+        let from = from.max(backing.base);
+        let to = to.min(backing.base + backing.bytes);
+        if from >= to { continue; }
+        if let Some(last) = joined.last_mut() && from <= last.1 {
+            last.1 = last.1.max(to);
+        } else { joined.push((from,to)); }
+    }
+    for (from,to) in joined {
+        let pages: Vec<usize> = (from / 4096..to.div_ceil(4096)).collect();
+        crate::watch::landed_beside(&pages, &[(from,to-from)]);
+        STATS[6].fetch_add(1, Relaxed);
+    }
+}
+
+pub(crate) fn log(frames: f64) {
+    let n = STATS.each_ref().map(|v| v.swap(0, Relaxed) as f64 / frames);
+    tracing::info!("VUM 1 per frame (VICTORY_VUM={}): {} live sections, {:.2} MiB live / {:.2} MiB charged; {:.2} alloc attempts, {:.2} admitted, {:.2} driver refusals, {:.2} logical views, {:.0} refresh steps omitted ({:.2} MiB requested), {:.0} GPU visibility notifications",
+        u8::from(enabled()), COUNT.load(Relaxed), LIVE.load(Relaxed) as f64 / 1048576.0,
+        CHARGED.load(Relaxed) as f64 / 1048576.0, n[0],n[1],n[2],n[3],n[4],n[5]/1048576.0,n[6]);
+}

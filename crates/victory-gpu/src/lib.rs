@@ -47,6 +47,10 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod vum;
+#[cfg(windows)]
+pub use vum::{allocate as vum_allocate, release as vum_release};
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;
