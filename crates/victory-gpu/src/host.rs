@@ -10689,6 +10689,20 @@ impl Host {
         }
     }
 
+    /// For local title-buffer shadows only. Keep the reservation's native
+    /// VA stable and its physical tiles independently owned. Internal
+    /// scratch, readback, comparison and texture resources stay unchanged.
+    pub(crate) fn stable_card_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        if let Some(buffer) = crate::vum::virtual_address::allocate(&self.device, size) {
+            MADE[4].fetch_add(1, Ordering::Relaxed);
+            MADE[5].fetch_add(size, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::book::made(&buffer, || "VUM stable GPU virtual buffer".into());
+            return Some(buffer);
+        }
+        self.uav_buffer(size)
+    }
+
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {

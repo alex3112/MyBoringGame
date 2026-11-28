@@ -5,6 +5,8 @@
 //! opt-in direct backing for committed pool segments. Normal remappable
 //! pool rendering stays on the legacy path pending descriptor rebinding.
 
+pub(crate) mod virtual_address;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -449,6 +451,7 @@ fn physical_ranges_join_only_within_the_same_generation() {
 }
 
 pub(crate) fn log(frames: f64) {
+    virtual_address::log(frames);
     let n = STATS.each_ref().map(|v| v.swap(0, Relaxed) as f64 / frames);
     tracing::info!("VUM 1 per frame (VICTORY_VUM={}): {} live sections, {:.2} MiB live / {:.2} MiB charged; {:.2} alloc attempts, {:.2} admitted, {:.2} driver refusals, {:.2} logical views, {:.0} refresh steps omitted ({:.2} MiB requested), {:.0} GPU visibility notifications",
         u8::from(enabled()), COUNT.load(Relaxed), LIVE.load(Relaxed) as f64 / 1048576.0,
