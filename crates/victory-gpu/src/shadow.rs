@@ -3321,7 +3321,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        crate::vum::demand::resolve_range(address, len);
+        crate::vum::demand::resolve_for_write(self.id,address,len);
         if self.place.is_some() {
             return;
         }
@@ -3820,6 +3820,11 @@ impl Shadow {
         let busy = if crate::watch::light() && !versioned_ownership() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
+            if crate::vum::demand::resident_on()
+                && crate::vum::demand::refresh_covered(self.id,a,e)==Some(true) {
+                continue;
+            }
+            let _resident_access=crate::vum::demand::resident_cpu_access(a,e-a);
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -4376,6 +4381,7 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        let _resident_access=crate::vum::demand::resident_cpu_access(from,to-from);
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4427,6 +4433,7 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let _resident_access=crate::vum::demand::resident_cpu_access(from,to.saturating_sub(from));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {

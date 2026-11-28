@@ -2666,6 +2666,7 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    resident: crate::vum::demand::Coverage,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -5130,6 +5131,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            resident: Default::default(),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5398,6 +5400,7 @@ impl Host {
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                            if plan.resident.skipped(r.shadow.id(),lo,hi) { continue; }
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if crate::vum::homes::writeback_on() && land::on()
                                 && r.shadow.home_published(behind, lo, hi)
@@ -5445,7 +5448,8 @@ impl Host {
                 })
                 .collect();
         }
-        if crate::vum::demand::enabled() && land::on() && !torn::on() && !upcheck::on() {
+        crate::vum::demand::learn(&pieces);
+        if crate::vum::demand::enabled() && !crate::vum::demand::resident_on() && land::on() && !torn::on() && !upcheck::on() {
             if let Ok(submitted) = self.submitted.try_lock() {
                 let producer = plans.iter().map(|p| p.1).max().unwrap_or(0);
                 if producer != 0 && *submitted == producer
@@ -5474,6 +5478,7 @@ impl Host {
             // fetch, if that goes to the queue the sends went to.
             let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
                 true => behind,
+                false if crate::vum::demand::resident_on() => behind,
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             crate::shadow::relay_fetched(after);
@@ -5805,7 +5810,7 @@ impl Host {
                 }
                 let mut hand_back = relay_hand_back(&back);
                 stage.next("landing: copies in the card's memory");
-                let demand_writes:Vec<Declared>=if crate::vum::demand::physical_on() {
+                let demand_writes:Vec<Declared>=if crate::vum::demand::legacy_physical_on() {
                     flights.iter().flat_map(|f| f.back.iter().cloned()).collect()
                 } else { Vec::new() };
                 self.relay_card_back(&plans, fetch, &mut || {
@@ -5813,7 +5818,7 @@ impl Host {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
-                }, if crate::vum::demand::physical_on() { &demand_writes } else { &back });
+                }, if crate::vum::demand::legacy_physical_on() { &demand_writes } else { &back });
                 stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
                 stage.next("landing: ranges done with");
@@ -6437,6 +6442,9 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::vum::demand::resident_on() && (!late || !relay() || !land::on() || torn::on() || upcheck::on()) {
+            crate::vum::demand::resolve_all();
+        }
         if crate::vum::demand::pending() {
             for list in runs {
                 let deferred = list.deferred();
@@ -6445,7 +6453,7 @@ impl Host {
                         Step::Refresh(shadow, at, len) => {
                             crate::vum::demand::resolve_foreign(shadow.id(), *at, *len);
                         }
-                        Step::GpuWrite(_, at, len) => crate::vum::demand::resolve_range(*at, *len),
+                        Step::GpuWrite(shadow, at, len) => crate::vum::demand::resolve_for_write(shadow.id(),*at,*len),
                         Step::Copy(to, from, len) | Step::Fill(to, from, len, _) => {
                             crate::vum::demand::resolve_range(*from, *len);
                             crate::vum::demand::resolve_range(*to, *len);
@@ -6458,8 +6466,14 @@ impl Host {
                             let (at,len)=staging.memory();
                             crate::vum::demand::resolve_range(at,len);
                         }
-                        // Opaque callbacks and placed copies still drain.
-                        Step::Run(_) | Step::Placed(_) => crate::vum::demand::resolve_all(),
+                        Step::Placed(p) if crate::vum::demand::resident_on() => {
+                            // CPU preparation can read/write these specific
+                            // spans, not unrelated resident resources.
+                            crate::vum::demand::resolve_range(p.src,p.len);
+                            crate::vum::demand::resolve_range(p.dst,p.len);
+                        }
+                        // Opaque callbacks still drain.
+                        Step::Run(_) | Step::Placed(_) => crate::vum::demand::resolve_opaque(),
                     }
                 }
                 for &(at, _, len) in &deferred.writes {
@@ -6712,7 +6726,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let mut card = self.card_before(&declared, &picked, flown);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -6755,15 +6769,38 @@ impl Host {
             // Keep remapping out of the final validation/send window, never
             // across a wait for the GPU or a relay landing.
             let mapping = physical_send_guard(runs,&descriptor_heaps);
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
+            let back = crate::picked::with(declared, &picked.written);
+            let resident = crate::vum::demand::resident_on() && flown
+                && land::on() && !torn::on() && !upcheck::on() && card.is_some();
+            if resident {
+                // All earlier write ranges remain in LINE.written until
+                // the relay finishes merging them, even if taken in hand.
+                let earlier=line().written_now();
+                let mut other=Vec::new();
+                for list in runs {
+                    let deferred=list.deferred();
+                    other.extend(deferred.writes.iter().map(|&(at,_,len)|(at,at.saturating_add(len))));
+                    other.extend(deferred.backs.iter().map(|(_,at,[row,rows,pitch])|
+                        (*at,at.saturating_add(rows.saturating_sub(1).saturating_mul(*pitch).saturating_add(*row)))));
+                    other.extend(deferred.texture_backs.iter().map(crate::texback::Back::range));
+                }
+                crate::vum::demand::prepare_resident(self,&self.queue,&back,&earlier,&other,
+                    card.as_ref().expect("resident card plan").sent_as);
+            } else if crate::vum::demand::resident_on() {
+                crate::vum::demand::resolve_all();
+            }
+            // SAFETY: closed lists; the fence is ours. The resident
+            // publication gate only surrounds actual enqueue, never the
+            // preparation or a wait for a relay/guest fence.
+            let (signalled,coverage) = crate::vum::demand::send_resident(&back,*submitted,||unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
-            };
+            });
+            if let Some(plan)=card.as_mut() { plan.resident=coverage; }
             drop(mapping);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
@@ -6775,7 +6812,6 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             split.part(5);
-            let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
                 texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
