@@ -6443,9 +6443,41 @@ impl Host {
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         if crate::vum::demand::resident_on() && (!late || !relay() || !crate::land::on() || torn::on() || upcheck::on()) {
-            crate::vum::demand::resolve_all();
+            crate::vum::demand::resolve_submit_fallback();
         }
-        if crate::vum::demand::pending() {
+        if crate::vum::demand::resident_on() && crate::vum::demand::pending() {
+            let mut plan=crate::vum::demand::Preflight::default();
+            for list in runs {
+                let deferred=list.deferred();
+                for step in &deferred.copies {
+                    match step {
+                        Step::Refresh(shadow,at,len) | Step::GpuWrite(shadow,at,len) => plan.foreign(shadow.id(),*at,*len),
+                        Step::Copy(to,from,len) | Step::Fill(to,from,len,_) => {
+                            plan.range(*from,*len);
+                            plan.range(*to,*len);
+                        }
+                        Step::Host(_, (from,to)) => plan.range(*from,to.saturating_sub(*from)),
+                        Step::Plane((from,len),_) => plan.range(*from,*len),
+                        Step::Texture(staging) => {
+                            let (at,len)=staging.memory();
+                            plan.range(at,len);
+                        }
+                        Step::Placed(p) => {
+                            plan.range(p.src,p.len);
+                            plan.range(p.dst,p.len);
+                        }
+                        Step::Run(_) => plan.opaque(),
+                    }
+                }
+                for &(at,_,len) in &deferred.writes { plan.range(at,len); }
+                for (_,at,[row,rows,pitch]) in &deferred.backs {
+                    plan.range(*at,rows.saturating_sub(1).saturating_mul(*pitch).saturating_add(*row));
+                }
+                if !deferred.texture_backs.is_empty() { plan.texture(); }
+            }
+            // No deferred lock is held during the GPU wait.
+            plan.finish();
+        } else if crate::vum::demand::pending() {
             for list in runs {
                 let deferred = list.deferred();
                 for step in &deferred.copies {
@@ -6786,8 +6818,15 @@ impl Host {
                 }
                 crate::vum::demand::prepare_resident(self,&self.queue,&back,&earlier,&other,
                     card.as_ref().expect("resident card plan").sent_as);
-            } else if crate::vum::demand::resident_on() {
-                crate::vum::demand::resolve_all();
+            } else if crate::vum::demand::resident_on()
+                && (!flown || !crate::land::on() || torn::on() || upcheck::on()
+                    || !back.is_empty())
+            {
+                // A missing CardPlan is not by itself a CPU consumer.
+                // Keep prior resident pages only if this submission has
+                // no declared writer at all (including nonlocal aliases).
+                // Otherwise retain the conservative drain.
+                crate::vum::demand::resolve_submit_fallback();
             }
             // SAFETY: closed lists; the fence is ours. The resident
             // publication gate only surrounds actual enqueue, never the

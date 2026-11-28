@@ -7,8 +7,9 @@
 //!
 //! The relay may capture pages only at a completed native-queue boundary
 //! with the submission lock held. An immutable local snapshot outlives
-//! the guest-visible fence. A separate copy queue materializes a page;
-//! it never waits on the submitting thread, relay, or guest fences.
+//! the guest-visible fence. A separate copy queue materializes snapshot
+//! pages; resident pages are read on the direct queue in producer order.
+//! Both engines batch readbacks and wait once per batch.
 //! The existing guard handles CPU writes after materialization.
 //! This is an opt-in pilot; arbitrary kernel reads/protection changes are
 //! not mediated by VEH. Do not select allocations used as OS I/O buffers.
@@ -113,6 +114,10 @@ struct State {
     // A real CPU access makes that physical page a poor lazy candidate.
     // Fixed upper bound; entries expire after 120 title frames.
     hot: BTreeMap<PhysicalKey, u64>,
+    // Forced compatibility publications also indicate poor residency candidates.
+    // Retry after a short cooldown rather than protecting the same page at
+    // every submission. This is separate from the real CPU-access history.
+    forced_until: BTreeMap<PhysicalKey, u64>,
     engine: Option<Engine>,
     resident_engine: Option<Engine>,
 }
@@ -241,7 +246,7 @@ impl Engine {
     fn new(host:&Host)->Option<Self> { Self::with_queue(host,None) }
 
     fn with_queue(host:&Host,direct:Option<&ID3D12CommandQueue>)->Option<Self> {
-        let buffer=host.read_back_buffer(PAGE as u64)?;
+        let buffer=host.read_back_buffer((PAGE*BATCH_PAGES) as u64)?;
         let ty=if direct.is_some() { D3D12_COMMAND_LIST_TYPE_DIRECT } else { D3D12_COMMAND_LIST_TYPE_COPY };
         unsafe {
             let allocator:ID3D12CommandAllocator=host.device.CreateCommandAllocator(ty).ok()?;
@@ -258,41 +263,53 @@ impl Engine {
             Some(Self{device:host.device.clone(),queue,allocator,list,fence,event,buffer,sent:0})
         }
     }
-    /// Snapshot is complete and immutable. No lock of the normal relay,
-    /// submission lane, guards, or resource registry is acquired here.
-    fn publish(&mut self,page:&Page)->windows::core::Result<()> {
-        // A CPU access can revoke a newly armed reservation before the
-        // new writer has been sent. The old CPU bytes are still current.
-        if matches!(&page.source,Source::Resident) && page.fence==0 {
-            return Self::restore(page);
-        }
-        self.sent+=1;
-        unsafe {
-            self.allocator.Reset()?;
-            self.list.Reset(&self.allocator,None)?;
-            let source=match &page.source {
-                Source::Snapshot(s)=>&s.buffer,
-                Source::Resident=>&page.shadow.buffer,
-            };
-            self.list.CopyBufferRegion(&self.buffer,0,source,page.offset,PAGE as u64);
-            self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
-            self.queue.Signal(&self.fence,self.sent)?;
-            self.fence.SetEventOnCompletion(self.sent,self.event.0)?;
-            if WaitForSingleObject(self.event.0,INFINITE)!=WAIT_OBJECT_0 {
-                return Err(windows::core::Error::from_thread());
+    /// One queue submission and one fence per batch, not per 64 KiB page.
+    /// STATE serializes producers, access faults and publication. Keep the
+    /// existing queue choice and producer ordering; no guard is restored
+    /// until the corresponding bytes are present in both CPU views.
+    fn publish_batch(&mut self,pages:&[Page])->windows::core::Result<()> {
+        assert!(pages.len()<=BATCH_PAGES);
+        let needs_copy=|p:&Page| !matches!(&p.source,Source::Resident) || p.fence!=0;
+        let copied=pages.iter().filter(|p|needs_copy(p)).count();
+        if copied!=0 {
+            self.sent+=1;
+            unsafe {
+                self.allocator.Reset()?;
+                self.list.Reset(&self.allocator,None)?;
+                for (i,page) in pages.iter().enumerate().filter(|(_,p)|needs_copy(p)) {
+                    let source=match &page.source {
+                        Source::Snapshot(s)=>&s.buffer,
+                        Source::Resident=>&page.shadow.buffer,
+                    };
+                    self.list.CopyBufferRegion(&self.buffer,(i*PAGE) as u64,source,page.offset,PAGE as u64);
+                }
+                self.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
+                self.queue.Signal(&self.fence,self.sent)?;
+                self.fence.SetEventOnCompletion(self.sent,self.event.0)?;
+                let waiting=std::time::Instant::now();
+                if WaitForSingleObject(self.event.0,INFINITE)!=WAIT_OBJECT_0 {
+                    return Err(windows::core::Error::from_thread());
+                }
+                BATCH_STATS[2].fetch_add(waiting.elapsed().as_nanos() as u64,Ordering::Relaxed);
+                self.device.GetDeviceRemovedReason()?;
+                let mut data=std::ptr::null_mut();
+                self.buffer.Map(0,None,Some(&mut data))?;
+                if data.is_null() { return Err(windows::core::Error::from_thread()); }
+                for (i,page) in pages.iter().enumerate().filter(|(_,p)|needs_copy(p)) {
+                    let src=data.cast::<u8>().add(i*PAGE);
+                    std::ptr::copy_nonoverlapping(src,page.alias as *mut u8,PAGE);
+                    std::ptr::copy_nonoverlapping(src,page.mirror as *mut u8,PAGE);
+                }
+                self.buffer.Unmap(0,None);
             }
-            self.device.GetDeviceRemovedReason()?;
-            let mut data=std::ptr::null_mut();
-            self.buffer.Map(0,None,Some(&mut data))?;
-            if data.is_null() { return Err(windows::core::Error::from_thread()); }
-            // The guest view remains inaccessible until both the private
-            // alias and the reference mirror hold the complete GPU version.
-            std::ptr::copy_nonoverlapping(data.cast::<u8>(),page.alias as *mut u8,PAGE);
-            std::ptr::copy_nonoverlapping(data.cast::<u8>(),page.mirror as *mut u8,PAGE);
-            self.buffer.Unmap(0,None);
+            BATCH_STATS[0].fetch_add(1,Ordering::Relaxed);
+            BATCH_STATS[1].fetch_add(copied as u64,Ordering::Relaxed);
         }
-        Self::restore(page)
+        // Unsent reservations need no GPU copy: their previous CPU bytes
+        // are still current. Restore those guards along with copied pages.
+        for page in pages { Self::restore(page)?; }
+        Ok(())
     }
 
     fn restore(page:&Page)->windows::core::Result<()> {
@@ -327,44 +344,143 @@ fn mark_hot(s:&mut State,key:PhysicalKey) {
     if s.hot.len()>=4096 && !s.hot.contains_key(&key) { s.hot.clear(); }
     s.hot.insert(key,crate::frame::current() as u64);
 }
-fn materialize(s:&mut State,keys:Vec<usize>,cpu:bool)->usize {
+const FORCED_RETRY_FRAMES:u64=8;
+static BATCH_STATS:[AtomicU64;3]=[const{AtomicU64::new(0)};3];
+static FORCED_COOLDOWN_SKIPS:AtomicU64=AtomicU64::new(0);
+
+#[derive(Clone,Copy)]
+#[repr(usize)]
+enum Publication { Range, Foreign, Cpu, Mapping, Refresh, Preflight, Opaque, Texture, Fallback, Landing, Other, All }
+static PUBLICATIONS:[AtomicU64;12]=[const{AtomicU64::new(0)};12];
+
+fn forced_cooldown(s:&mut State,key:PhysicalKey,now:u64) {
+    if s.forced_until.len()>=8192 && !s.forced_until.contains_key(&key) {
+        s.forced_until.retain(|_,until|*until>now);
+        if s.forced_until.len()>=8192 { let _=s.forced_until.pop_first(); }
+    }
+    s.forced_until.insert(key,now.saturating_add(FORCED_RETRY_FRAMES));
+}
+fn forced_hot(s:&State,key:PhysicalKey,now:u64)->bool {
+    s.forced_until.get(&key).is_some_and(|&until|now<until)
+}
+
+fn materialize(s:&mut State,keys:Vec<usize>,reason:Publication)->usize {
     let n=keys.len();
-    for at in keys {
-        let page=s.pages.remove(&at).expect("pending page");
-        let resident=matches!(&page.source,Source::Resident);
+    let cpu=matches!(reason,Publication::Cpu);
+    let mut remaining=keys.as_slice();
+    while !remaining.is_empty() {
+        let resident=matches!(&s.pages[&remaining[0]].source,Source::Resident);
+        // The two engines have different queue-ordering guarantees. Never
+        // combine pages belonging to different engines in one native list.
+        let count=remaining.iter().take(BATCH_PAGES).take_while(|&&at|
+            matches!(&s.pages[&at].source,Source::Resident)==resident).count();
+        let (batch,rest)=remaining.split_at(count);
+        remaining=rest;
+        let pages:Vec<Page>=batch.iter().map(|at|s.pages.remove(at).expect("pending page")).collect();
         let engine=if resident { &mut s.resident_engine } else { &mut s.engine };
-        if let Err(e)=engine.as_mut().expect("demand engine").publish(&page) {
-            crate::host::fail(format_args!("VUM demand publication failed at {at:#x}, producer {}: {e}",page.fence));
+        if let Err(e)=engine.as_mut().expect("demand engine").publish_batch(&pages) {
+            crate::host::fail(format_args!("VUM demand batch publication failed at {:#x}, {} pages: {e}",batch[0],pages.len()));
         }
-        for view in &page.views { s.aliases.remove(view); }
-        let copied=!resident || page.fence!=0;
-        if resident {
-            if copied { RESIDENT_STATS[3].fetch_add(PAGE as u64,Ordering::Relaxed); }
-            else { REVOKED.fetch_add(1,Ordering::Relaxed); }
-            if cpu { RESIDENT_STATS[4].fetch_add(1,Ordering::Relaxed); }
+        if resident { PUBLICATIONS[reason as usize].fetch_add(count as u64,Ordering::Relaxed); }
+        for page in pages {
+            for view in &page.views { s.aliases.remove(view); }
+            let copied=!resident || page.fence!=0;
+            if resident {
+                if copied { RESIDENT_STATS[3].fetch_add(PAGE as u64,Ordering::Relaxed); }
+                else { REVOKED.fetch_add(1,Ordering::Relaxed); }
+                if cpu { RESIDENT_STATS[4].fetch_add(1,Ordering::Relaxed); }
+            }
+            if let PageIdentity::Physical(key)=page.identity {
+                s.physical.remove(&key);
+                PHYSICAL_STATS[3].fetch_add(1,Ordering::Relaxed);
+                if cpu { mark_hot(s,key); }
+                else if resident && copied { forced_cooldown(s,key,crate::frame::current() as u64); }
+            }
+            PENDING.fetch_sub(1,Ordering::AcqRel);
+            if copied { STATS[4].fetch_add(PAGE as u64,Ordering::Relaxed); }
         }
-        if let PageIdentity::Physical(key)=page.identity {
-            s.physical.remove(&key);
-            PHYSICAL_STATS[3].fetch_add(1,Ordering::Relaxed);
-            if cpu { mark_hot(s,key); }
-        }
-        PENDING.fetch_sub(1,Ordering::AcqRel);
-        if copied { STATS[4].fetch_add(PAGE as u64,Ordering::Relaxed); }
     }
     n
 }
-fn resolve_locked(s:&mut State, at:usize,len:usize, except:Option<u64>) -> usize {
+fn resolve_locked(s:&mut State,at:usize,len:usize,except:Option<u64>)->usize {
     let keys=virtual_keys(s,at,len,except);
-    materialize(s,keys,false)
+    materialize(s,keys,Publication::Mapping)
 }
 
-pub(crate) fn resolve_range(at:usize,len:usize) {
+fn resolve_range_as(at:usize,len:usize,reason:Publication) {
     if !might_need(at,len) { return; }
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     if let Some(s)=state.as_mut() {
-        STATS[3].fetch_add(resolve_locked(s,at,len,None) as u64,Ordering::Relaxed);
+        let keys=virtual_keys(s,at,len,None);
+        STATS[3].fetch_add(materialize(s,keys,reason) as u64,Ordering::Relaxed);
     }
 }
+pub(crate) fn resolve_range(at:usize,len:usize) { resolve_range_as(at,len,Publication::Range); }
+
+/// Gather the union of publication requests before preparation performs
+/// any CPU memory accesses. The same alias must not trigger multiple
+/// submissions. Unknown callbacks still conservatively drain all pages.
+#[derive(Default)]
+pub(crate) struct Preflight {
+    requests:Vec<(Option<u64>,usize,usize)>,
+    all:Option<Publication>,
+}
+fn joined_requests(mut requests:Vec<(Option<u64>,usize,usize)>)->Vec<(Option<u64>,usize,usize)> {
+    requests.sort_unstable();
+    let mut out:Vec<(Option<u64>,usize,usize)>=Vec::new();
+    for (id,a,b) in requests {
+        if let Some(last)=out.last_mut() && last.0==id && a<=last.2 {
+            last.2=last.2.max(b);
+        } else { out.push((id,a,b)); }
+    }
+    out
+}
+impl Preflight {
+    fn request(&mut self,id:Option<u64>,at:usize,len:usize) {
+        if self.all.is_none() && len!=0 && might_need(at,len) {
+            self.requests.push((id,at,at.saturating_add(len)));
+        }
+    }
+    pub(crate) fn range(&mut self,at:usize,len:usize) { self.request(None,at,len); }
+    pub(crate) fn foreign(&mut self,id:u64,at:usize,len:usize) { self.request(Some(id),at,len); }
+    pub(crate) fn opaque(&mut self) { if self.all.is_none() { self.all=Some(Publication::Opaque); } }
+    pub(crate) fn texture(&mut self) { if self.all.is_none() { self.all=Some(Publication::Texture); } }
+    fn finish_as(self,reason:Publication) {
+        if self.requests.is_empty() && self.all.is_none() { return; }
+        let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
+        let Some(s)=state.as_mut() else { return; };
+        let reason=self.all.unwrap_or(reason);
+        let keys=if self.all.is_some() {
+            if matches!(reason,Publication::Opaque) && !s.pages.is_empty() {
+                OPAQUE_DRAIN.fetch_add(1,Ordering::Relaxed);
+            }
+            s.pages.keys().copied().collect()
+        } else {
+            let mut keys=Vec::new();
+            for (id,a,b) in joined_requests(self.requests) {
+                for (&alias,&primary) in s.aliases.range(a/PAGE*PAGE..b) {
+                    if id.is_none_or(|id|alias!=primary || s.pages[&primary].shadow.id()!=id) {
+                        keys.push(primary);
+                    }
+                }
+            }
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        };
+        STATS[3].fetch_add(materialize(s,keys,reason) as u64,Ordering::Relaxed);
+    }
+    pub(crate) fn finish(self) { self.finish_as(Publication::Preflight); }
+}
+
+pub(crate) fn resolve_landing(ranges:impl Iterator<Item=(usize,usize)>) {
+    if !pending() { return; }
+    let mut plan=Preflight::default();
+    for (at,len) in ranges { plan.range(at,len); }
+    plan.finish_as(Publication::Landing);
+}
+pub(crate) fn resolve_submit_fallback() { resolve_range_as(0,usize::MAX,Publication::Fallback); }
+
 /// Known kernel reads/copies are leased for the whole call, not merely
 /// checked before it. Admission tests these ranges under the same mutex,
 /// so a page cannot become inaccessible in the middle of a kernel read.
@@ -442,7 +558,7 @@ pub(crate) fn cpu_access(at:usize,len:usize)->CpuAccess {
             let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
             if let Some(s)=state.as_mut() {
                 let keys=virtual_keys(s,at,len,None);
-                STATS[3].fetch_add(materialize(s,keys,true) as u64,Ordering::Relaxed);
+                STATS[3].fetch_add(materialize(s,keys,Publication::Cpu) as u64,Ordering::Relaxed);
             }
         }
         return CpuAccess(0,Some(lease));
@@ -457,7 +573,7 @@ pub(crate) fn cpu_access(at:usize,len:usize)->CpuAccess {
         return CpuAccess(0,None);
     }
     let keys=virtual_keys(s,at,len,None);
-    STATS[3].fetch_add(materialize(s,keys,true) as u64,Ordering::Relaxed);
+    STATS[3].fetch_add(materialize(s,keys,Publication::Cpu) as u64,Ordering::Relaxed);
     let id=NEXT_ACCESS.fetch_add(1,Ordering::Relaxed);
     s.active.insert(id,AccessRange::Virtual(at,end));
     CpuAccess(id,None)
@@ -475,7 +591,7 @@ pub fn physical_access(section:usize,offset:u64,len:usize)->CpuAccess {
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     let s=state.get_or_insert_with(State::default);
     let keys=physical_keys(s,generation,offset,len as u64);
-    STATS[3].fetch_add(materialize(s,keys,true) as u64,Ordering::Relaxed);
+    STATS[3].fetch_add(materialize(s,keys,Publication::Cpu) as u64,Ordering::Relaxed);
     let id=NEXT_ACCESS.fetch_add(1,Ordering::Relaxed);
     s.active.insert(id,AccessRange::Physical(generation,offset,offset.saturating_add(len as u64)));
     CpuAccess(id,None)
@@ -489,7 +605,7 @@ pub fn before_physical_map(section:usize,offset:u64,len:usize) {
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     if let Some(s)=state.as_mut() {
         let keys=physical_keys(s,generation,offset,len as u64);
-        PHYSICAL_STATS[4].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
+        PHYSICAL_STATS[4].fetch_add(materialize(s,keys,Publication::Mapping) as u64,Ordering::Relaxed);
     }
 }
 
@@ -497,9 +613,10 @@ pub(crate) fn section_gone(section:usize) {
     if !pending() || !physical_on() { return; }
     before_physical_map(section,0,usize::MAX);
 }
-pub(crate) fn resolve_all() { resolve_range(0,usize::MAX); }
+pub(crate) fn resolve_all() { resolve_range_as(0,usize::MAX,Publication::All); }
 pub(crate) fn resolve_mapping(at:usize,len:usize) {
-    if len==0 { resolve_all(); } else { resolve_range(at,len); }
+    if len==0 { resolve_range_as(0,usize::MAX,Publication::Mapping); }
+    else { resolve_range_as(at,len,Publication::Mapping); }
 }
 pub(crate) fn resolve_foreign(id:u64,at:usize,len:usize) {
     if !might_need(at,len) { return; }
@@ -509,7 +626,7 @@ pub(crate) fn resolve_foreign(id:u64,at:usize,len:usize) {
             (a!=primary || s.pages[&primary].shadow.id()!=id).then_some(primary)
         }).collect();
         keys.sort_unstable(); keys.dedup();
-        STATS[3].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
+        STATS[3].fetch_add(materialize(s,keys,Publication::Foreign) as u64,Ordering::Relaxed);
     }
 }
 
@@ -518,7 +635,7 @@ pub(crate) fn fault(at:usize,write:bool)->bool {
     let mut state=STATE.lock().unwrap_or_else(|e|e.into_inner());
     let Some(s)=state.as_mut() else { return false; };
     let keys=virtual_keys(s,at,1,None);
-    if materialize(s,keys,true)!=0 {
+    if materialize(s,keys,Publication::Cpu)!=0 {
         STATS[2].fetch_add(1,Ordering::Relaxed);
         return true;
     }
@@ -570,7 +687,7 @@ pub(crate) fn refresh_gaps(id:u64,from:usize,to:usize)->Option<Vec<(usize,usize)
         (a!=primary || s.pages[&primary].shadow.id()!=id).then_some(primary)
     }).collect();
     keys.sort_unstable(); keys.dedup();
-    STATS[3].fetch_add(materialize(s,keys,false) as u64,Ordering::Relaxed);
+    STATS[3].fetch_add(materialize(s,keys,Publication::Refresh) as u64,Ordering::Relaxed);
     let out=gaps(from,to,s.aliases.range(first..to).map(|(&a,_)|a));
     STATS[5].fetch_add(1,Ordering::Relaxed);
     Some(out)
@@ -781,7 +898,9 @@ pub(crate) fn resolve_for_write(id:u64,at:usize,len:usize) {
 pub(crate) fn prepare_resident(host:&Host,queue:&ID3D12CommandQueue,declared:&[Declared],
     earlier:&[(usize,usize)],other:&[(usize,usize)],after:u64) {
     if !resident_on() || declared.is_empty() { return; }
-    for &(a,b) in other { resolve_range(a,b.saturating_sub(a)); }
+    let mut plan=Preflight::default();
+    for &(a,b) in other { plan.range(a,b.saturating_sub(a)); }
+    plan.finish_as(Publication::Other);
     let Some(_mapping)=crate::watch::title_memory_reading_now() else { return; };
     let now=crate::frame::current() as u64;
     let keys={
@@ -836,6 +955,7 @@ pub(crate) fn prepare_resident(host:&Host,queue:&ID3D12CommandQueue,declared:&[D
             let state=STATE.lock().unwrap_or_else(|e|e.into_inner());
             let s=state.as_ref().expect("resident state");
             if s.physical.contains_key(&key) || s.hot.get(&key).is_some_and(|&f|now.saturating_sub(f)<120) { continue; }
+            if forced_hot(s,key,now) { FORCED_COOLDOWN_SKIPS.fetch_add(1,Ordering::Relaxed); continue; }
         }
         let c=Candidate{i:0,shadow,lo,mirror,identity:PageIdentity::Physical(key),views};
         // At this point all uploads for the next submission are queued,
@@ -907,6 +1027,11 @@ pub(crate) fn send_resident<T>(declared:&[Declared],fence:u64,send:impl FnOnce()
 }
 
 pub(crate) fn line(frames:f64) {
+    let [batches,pages,wait]=BATCH_STATS.each_ref().map(|n|n.swap(0,Ordering::Relaxed) as f64);
+    let f=frames.max(1.0);
+    let [range,foreign,cpu,mapping,refresh,preflight,opaque,texture,fallback,landing,other,all]=PUBLICATIONS.each_ref().map(|n|n.swap(0,Ordering::Relaxed) as f64/f);
+    tracing::info!("VUM publication batches: {:.2} submissions/frame, {:.1} pages/frame, {:.1} pages/submission, {:.2} ms fence wait/frame, {:.1} forced cooldown skips/frame",batches/f,pages/f,pages/batches.max(1.0),wait/1e6/f,FORCED_COOLDOWN_SKIPS.swap(0,Ordering::Relaxed) as f64/f);
+    tracing::info!("VUM resident publication origins (pages/frame): range {:.1}, foreign {:.1}, CPU {:.1}, mapping {:.1}, refresh {:.1}, preflight {:.1}, opaque {:.1}, texture {:.1}, submit fallback {:.1}, landing {:.1}, other {:.1}, all {:.1}",range,foreign,cpu,mapping,refresh,preflight,opaque,texture,fallback,landing,other,all);
     let [c,a,s,m,f,w,o,g]=RESIDENT_STATS.each_ref().map(|n|n.swap(0,Ordering::Relaxed) as f64/frames.max(1.0));
     tracing::info!("VUM resident (VICTORY_VUM_RESIDENT={}): {:.1} candidates, {:.1} new pages, {:.3} MiB eager readback requests omitted, {:.3} MiB actual demand readback, {:.1} CPU publications, {:.1} same-home producer continuations, {:.1} earlier writer refusals, {:.1} other refusals/frame; {} pending pages; {:.1} pre-send revocations, {:.1} opaque drains/frame",
         u8::from(resident_on()),c,a,s/1048576.0,m/1048576.0,f,w,o,g,PENDING.load(Ordering::Acquire),
@@ -950,6 +1075,21 @@ mod tests {
         assert!(!active(&s,PageIdentity::Physical(PhysicalKey{generation:8,offset:0}),&[30*PAGE]));
         s.active.insert(2,AccessRange::Virtual(20*PAGE+3,20*PAGE+4));
         assert!(active(&s,PageIdentity::Physical(PhysicalKey{generation:8,offset:0}),&[10*PAGE,20*PAGE]));
+    }
+    #[test] fn forced_cooldown_is_scoped_to_physical_identity_and_expires() {
+        let mut s=State::default();
+        let a=PhysicalKey{generation:7,offset:0};
+        let b=PhysicalKey{generation:8,offset:0};
+        forced_cooldown(&mut s,a,100);
+        assert!(forced_hot(&s,a,100));
+        assert!(forced_hot(&s,a,107));
+        assert!(!forced_hot(&s,a,108));
+        assert!(!forced_hot(&s,b,101));
+    }
+    #[test] fn preflight_merges_only_requests_with_same_owner() {
+        assert_eq!(joined_requests(vec![(Some(3),PAGE,2*PAGE),(None,0,PAGE),
+            (Some(3),0,PAGE),(Some(4),PAGE,2*PAGE),(None,PAGE,3*PAGE)]),
+            vec![(None,0,3*PAGE),(Some(3),0,2*PAGE),(Some(4),PAGE,2*PAGE)]);
     }
     #[test] fn owner_excludes_header_crossings_and_outside() {
         let mut s=State::default();

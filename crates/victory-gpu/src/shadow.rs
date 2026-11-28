@@ -4866,9 +4866,8 @@ impl Shadow {
     /// missing. The proof is committed by Notes after its journal writes.
     pub(crate) unsafe fn land_home(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes, publication: Option<crate::vum::homes::PublicationEpoch>) -> u64 {
         if crate::vum::demand::pending() {
-            for &(lo, hi, _) in pieces {
-                crate::vum::demand::resolve_range(self.start as usize + lo, hi.saturating_sub(lo));
-            }
+            crate::vum::demand::resolve_landing(pieces.iter().map(|&(lo,hi,_)|
+                (self.start as usize+lo,hi.saturating_sub(lo))));
         }
         let Some(card) = &self.card else {
             return 0;
