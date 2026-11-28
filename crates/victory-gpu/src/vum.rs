@@ -1,7 +1,9 @@
 //! VUM 1: a dedicated XMem allocation backed by one committed section.
 //! The CPU mapping and a single native buffer use the same physical pages.
 //! Logical buffers/windows retain their bounds and share the native buffer.
-//! No address-opened heap or remappable page-pool view is admitted here.
+//! VUM 2 adds generation-stable physical section identities and a bounded,
+//! opt-in direct backing for committed pool segments. Normal remappable
+//! pool rendering stays on the legacy path pending descriptor rebinding.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -30,10 +32,15 @@ pub(crate) struct Backing {
     heap: ID3D12Heap,
     buffer: ID3D12Resource,
     gpu: u64,
+    physical: Option<(usize, u64)>,
 }
 impl Drop for Backing {
     fn drop(&mut self) {
-        CHARGED.fetch_sub(self.bytes as u64, Relaxed);
+        if self.physical.is_some() {
+            POOL_CHARGED.fetch_sub(self.bytes as u64, Relaxed);
+        } else {
+            CHARGED.fetch_sub(self.bytes as u64, Relaxed);
+        }
     }
 }
 
@@ -98,7 +105,7 @@ pub fn allocate(size: usize, attributes: u64) -> Option<usize> {
     let id = NEXT.fetch_add(1, Relaxed);
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     crate::host::name(&buffer, || format!("VUM section {id} ({bytes:#x} bytes)"));
-    let backing = Arc::new(Backing { id, base, bytes, heap, buffer, gpu });
+    let backing = Arc::new(Backing { id, base, bytes, heap, buffer, gpu, physical: None });
     // Register the CPU mapping with existing alias-aware guards so that a
     // legacy texture or crossing view can still observe updates.
     {
@@ -143,16 +150,16 @@ pub fn release(base: usize) -> bool {
 }
 
 pub(crate) fn place_for(start: u64, len: u64) -> Option<(crate::inplace::Placed, Arc<Backing>)> {
-    if COUNT.load(Relaxed) == 0 || len == 0 { return None; }
+    if len == 0 { return None; }
     let start = usize::try_from(start).ok()?;
     let end = start.checked_add(usize::try_from(len).ok()?)?;
-    let backing = {
+    let dedicated = if COUNT.load(Relaxed) == 0 { None } else {
         let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
-        let (&base, a) = map.range(..=start).next_back()?;
-        if end > base.checked_add(a.backing.bytes)? { return None; }
-        a.backing.clone()
+        map.range(..=start).next_back().and_then(|(&base,a)| {
+            (end <= base.checked_add(a.backing.bytes)?).then(|| (a.backing.clone(), (start-base) as u64))
+        })
     };
-    let bias = (start - backing.base) as u64;
+    let (backing, bias) = dedicated.or_else(|| pool_backing(start, end - start))?;
     let placed = crate::inplace::Placed { buffer: backing.buffer.clone(), heap: backing.heap.clone(),
         gpu: backing.gpu + bias, bias };
     STATS[3].fetch_add(1, Relaxed);
@@ -191,8 +198,32 @@ pub(crate) fn refresh_omitted(len: usize) {
 /// the guest fence. The bytes are already in the CPU mapping; only old
 /// fallback copies/texture views need a journal notification. Never mark
 /// a recycled virtual address from an old flight.
-pub(crate) fn landed(backing: &Backing, ranges: &[(usize, usize)]) {
+pub(crate) fn landed(backing: &Backing, guest_start: u64, bias: u64, ranges: &[(usize, usize)]) {
     let _mapping = crate::watch::title_memory_reading();
+    if let Some((section,generation)) = backing.physical {
+        // Use the physical coordinates captured by the recording, not the
+        // mapping currently visible at its original guest address.
+        let mut aliases = Vec::new();
+        for &(from,to) in ranges {
+            let from = (from as u64).max(guest_start);
+            if from >= to as u64 { continue; }
+            let Some(offset) = bias.checked_add(from-guest_start) else { continue; };
+            let len = (to as u64-from).min((backing.bytes as u64).saturating_sub(offset));
+            aliases.extend(crate::inplace::physical_aliases(section,generation,offset,len));
+        }
+        aliases.sort_unstable();
+        let mut joined: Vec<(usize,usize)> = Vec::new();
+        for (a,b) in aliases {
+            if let Some(last) = joined.last_mut() && a <= last.1 { last.1 = last.1.max(b); }
+            else { joined.push((a,b)); }
+        }
+        for (a,b) in joined {
+            crate::watch::wrote(a,b-a);
+            crate::descriptor::host::remapped(a,b-a);
+            POOL_STATS[5].fetch_add(1, Relaxed);
+        }
+        return;
+    }
     let current = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner())
         .get(&backing.base).is_some_and(|a| a.backing.id == backing.id);
     if !current { return; }
@@ -214,9 +245,121 @@ pub(crate) fn landed(backing: &Backing, ranges: &[(usize, usize)]) {
     }
 }
 
+// Separate budget: pool segments must not evict dedicated VUM1 allocations.
+// Only the experiment creates committed pool segments and admits them.
+static POOL_CHARGED: AtomicU64 = AtomicU64::new(0);
+static POOL_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+struct PoolEntry {
+    section: usize,
+    bytes: u64,
+    backing: Option<Arc<Backing>>,
+    refused: bool,
+}
+static POOLS: Mutex<BTreeMap<u64, PoolEntry>> = Mutex::new(BTreeMap::new());
+static POOL_VIEWS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+static POOL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn physical_experiment() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var_os("VICTORY_VUM_PHYSICAL").is_some_and(|v| v == "1"))
+}
+
+pub fn physical_budget() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("VICTORY_VUM_PHYSICAL_MB").ok()
+        .and_then(|v| v.parse::<u64>().ok()).map(|n| n.min(512) << 20).unwrap_or(128 << 20))
+}
+
+/// Register only committed segments deliberately created by XMem, not the
+/// dedicated VUM1 allocations or the legacy multi-GiB reserved sections.
+pub fn register_pool(section: usize, bytes: u64) {
+    if !physical_experiment() { return; }
+    let Some(generation) = crate::inplace::section_generation(section) else { return; };
+    POOLS.lock().unwrap_or_else(|e| e.into_inner()).insert(generation,
+        PoolEntry { section, bytes, backing: None, refused: false });
+    POOL_COUNT.fetch_add(1, Relaxed);
+    POOL_STATS[0].fetch_add(1, Relaxed);
+}
+
+pub(crate) fn pool_gone(generation: u64) {
+    if POOL_COUNT.load(Relaxed) == 0 { return; }
+    let gone = POOLS.lock().unwrap_or_else(|e| e.into_inner()).remove(&generation);
+    if let Some(mut entry) = gone {
+        POOL_COUNT.fetch_sub(1, Relaxed);
+        if let Some(backing) = entry.backing.take() { crate::host::retire(backing); }
+    }
+}
+
+fn pool_backing(start: usize, len: usize) -> Option<(Arc<Backing>, u64)> {
+    if POOL_COUNT.load(Relaxed) == 0 || !physical_experiment() { return None; }
+    let run = crate::inplace::physical_run(start,len)?;
+    if !run.committed || run.bytes > MAX as u64 { return None; }
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = pools.get_mut(&run.generation)?;
+    if entry.section != run.section || entry.bytes != run.bytes || entry.refused { return None; }
+    let backing = if let Some(backing) = &entry.backing {
+        POOL_STATS[3].fetch_add(1, Relaxed);
+        backing.clone()
+    } else {
+        let host = crate::host::existing_host()?;
+        POOL_STATS[1].fetch_add(1, Relaxed);
+        POOL_CHARGED.fetch_update(Relaxed, Relaxed, |n| n.checked_add(run.bytes)
+            .filter(|&v| v <= physical_budget())).ok()?;
+        let native = crate::inplace::open(&host.device, crate::inplace::From::Section(run.section))
+            .and_then(|heap| crate::inplace::place(&host.device, &heap, 0, run.bytes).map(|buffer| (heap,buffer)));
+        let (heap, buffer) = match native {
+            Ok(native) => native,
+            Err(e) => {
+                POOL_CHARGED.fetch_sub(run.bytes, Relaxed);
+                entry.refused = true;
+                POOL_STATS[2].fetch_add(1, Relaxed);
+                tracing::warn!(error = %e, generation = run.generation, "VUM 2: native physical segment refused");
+                return None;
+            }
+        };
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let id = NEXT.fetch_add(1, Relaxed);
+        let backing = Arc::new(Backing { id, base: 0, bytes: run.bytes as usize, heap,buffer,gpu,
+            physical: Some((run.section,run.generation)) });
+        entry.backing = Some(backing.clone());
+        tracing::info!(id, generation = run.generation, bytes = run.bytes, "VUM 2: physical segment opened once");
+        backing
+    };
+    drop(pools);
+    let mut bound = POOL_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    bound.entry(start).and_modify(|end| *end = (*end).max(start+len)).or_insert(start+len);
+    POOL_STATS[4].fetch_add(1, Relaxed);
+    Some((backing, run.offset))
+}
+
+/// Only used by the experimental direct pool path. Remove VA associations
+/// on remap, but retain the physical backing itself and in-flight resources.
+pub(crate) fn pool_remapping(at: usize,len: usize) -> bool {
+    if !physical_experiment() || len == 0 { return false; }
+    let end = at.saturating_add(len);
+    let mut bound = POOL_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let old: Vec<usize> = bound.range(..end).filter(|(_,b)| **b > at).map(|(&a,_)| a).collect();
+    if old.is_empty() { return false; }
+    for a in old { bound.remove(&a); }
+    if POOL_STATS[6].fetch_add(1, Relaxed) == 0 {
+        tracing::warn!("VUM 2 experimental: a bound pool view was remapped; old recorded GPU addresses are not retargeted");
+    }
+    true
+}
+
+pub(crate) fn mapping_current(backing: &Backing, start: u64, len: u64, bias: u64) -> bool {
+    let Some((section,generation)) = backing.physical else { return true; };
+    crate::inplace::physical_run(start as usize,len as usize)
+        .is_some_and(|r| r.section == section && r.generation == generation && r.offset == bias)
+}
+
 pub(crate) fn log(frames: f64) {
     let n = STATS.each_ref().map(|v| v.swap(0, Relaxed) as f64 / frames);
     tracing::info!("VUM 1 per frame (VICTORY_VUM={}): {} live sections, {:.2} MiB live / {:.2} MiB charged; {:.2} alloc attempts, {:.2} admitted, {:.2} driver refusals, {:.2} logical views, {:.0} refresh steps omitted ({:.2} MiB requested), {:.0} GPU visibility notifications",
         u8::from(enabled()), COUNT.load(Relaxed), LIVE.load(Relaxed) as f64 / 1048576.0,
         CHARGED.load(Relaxed) as f64 / 1048576.0, n[0],n[1],n[2],n[3],n[4],n[5]/1048576.0,n[6]);
+    let p = POOL_STATS.each_ref().map(|n| n.swap(0,Relaxed) as f64 / frames);
+    tracing::info!("VUM 2 physical (VICTORY_VUM_PHYSICAL={}): {} committed candidate segments, {:.2} MiB native charged; per frame {:.2} registered, {:.2} opens, {:.2} refusals, {:.2} backing reuses, {:.2} binds, {:.2} alias publications, {:.2} bound remaps",
+        u8::from(physical_experiment()), POOL_COUNT.load(Relaxed), POOL_CHARGED.load(Relaxed) as f64/1048576.0,
+        p[0],p[1],p[2],p[3],p[4],p[5],p[6]);
 }

@@ -3822,7 +3822,7 @@ impl Shadow {
     /// last submission that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if let Some(backing) = &self.vum {
-            crate::vum::landed(backing, ranges);
+            crate::vum::landed(backing, self.start, self.place.as_ref().map_or(0, |p| p.1), ranges);
             return;
         }
         if self.place.is_some() {
@@ -5364,6 +5364,7 @@ pub(crate) fn native_backing(buffer: &ID3D12Resource, address: u64, len: u64) ->
             .filter(|s| {
                 let (at,n) = s.span();
                 address >= at && address.checked_add(len).is_some_and(|end| end <= at + n)
+                    && s.vum.as_ref().is_some_and(|b| crate::vum::mapping_current(b,at,n,s.place.as_ref().map_or(0,|p| p.1)))
             }).min_by_key(|s| s.span().1)
     })?;
     let (start, width) = shadow.span();

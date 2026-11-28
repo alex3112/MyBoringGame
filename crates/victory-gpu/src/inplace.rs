@@ -181,7 +181,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
+    let pool = crate::vum::pool_remapping(at, len);
+    if !pool && STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
@@ -274,7 +275,7 @@ struct Views {
     /// Of those, how many are shown more than once.
     pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: Vec<(usize, u64, bool, u64)>,
     /// Our own view of a whole section, by its handle (0: the host gave
     /// none), made when first asked for ([`beside`]) and kept.
     whole: Vec<(usize, usize)>,
@@ -306,18 +307,23 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
-    v.sections.push((section, bytes, committed));
+    static NEXT_SECTION: AtomicU64 = AtomicU64::new(1);
+    v.sections.push((section, bytes, committed, NEXT_SECTION.fetch_add(1, Ordering::Relaxed)));
 }
 
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
-    let whole = {
+    let (whole, generation) = {
         let mut v = views_mut();
+        let generation = v.sections.iter().find(|s| s.0 == section).map(|s| s.3);
         v.sections.retain(|s| s.0 != section);
         let at = v.whole.iter().position(|w| w.0 == section);
-        at.map(|i| v.whole.swap_remove(i).1)
+        (at.map(|i| v.whole.swap_remove(i).1), generation)
     };
+    if let Some(generation) = generation {
+        crate::vum::pool_gone(generation);
+    }
     if let Some(base) = whole.filter(|&base| base != 0) {
         // SAFETY: a view of ours. Who writes through it found the section
         // in a view the title saw and holds off its unmapping
@@ -521,6 +527,50 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
 
+/// The physical identity of a contiguous guest span. The section generation
+/// prevents Windows handle reuse from joining two unrelated page pools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalRun {
+    pub(crate) section: usize,
+    pub(crate) generation: u64,
+    pub(crate) offset: u64,
+    pub(crate) bytes: u64,
+    pub(crate) committed: bool,
+}
+
+pub(crate) fn physical_run(at: usize, len: usize) -> Option<PhysicalRun> {
+    at.checked_add(len.max(1))?;
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, len) else { return None; };
+    let &(_, bytes, committed, generation) = v.sections.iter().find(|s| s.0 == section)?;
+    if offset.checked_add(len as u64)? > bytes { return None; }
+    Some(PhysicalRun { section, generation, offset, bytes, committed })
+}
+
+pub(crate) fn section_generation(section: usize) -> Option<u64> {
+    views().sections.iter().find(|s| s.0 == section).map(|s| s.3)
+}
+
+/// Exact virtual aliases of a physical byte span, including partial views.
+/// Used only on direct-pool completion (not in the normal draw hot path).
+pub(crate) fn physical_aliases(section: usize, generation: u64, from: u64, len: u64) -> Vec<(usize,usize)> {
+    let v = views();
+    if !v.sections.iter().any(|s| s.0 == section && s.3 == generation) { return Vec::new(); }
+    let Some(to) = from.checked_add(len) else { return Vec::new(); };
+    let mut out: Vec<(usize,usize)> = Vec::new();
+    for (&base, &(bytes, handle, offset)) in &v.views {
+        if handle != section { continue; }
+        let a = offset.max(from);
+        let b = offset.saturating_add(bytes as u64).min(to);
+        if a >= b { continue; }
+        let start = base + (a - offset) as usize;
+        let end = base + (b - offset) as usize;
+        if let Some(last) = out.last_mut() && last.1 == start { last.1 = end; }
+        else { out.push((start,end)); }
+    }
+    out
+}
+
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
@@ -552,7 +602,7 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
     let base = match v.whole.iter().find(|w| w.0 == section) {
         Some(w) => w.1,
         None => {
-            let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+            let &(_, bytes, _, _) = v.sections.iter().find(|s| s.0 == section)?;
             // SAFETY: the whole of a section the runtime made; a view the
             // title sees is of it, so its handle is open.
             let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
@@ -1146,7 +1196,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    for &(_, bytes, committed, _) in &v.sections {
         lines.push(format!(
             "census, a section of {} MB, {}",
             bytes >> 20,

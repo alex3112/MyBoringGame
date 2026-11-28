@@ -545,6 +545,8 @@ struct Section {
     window: std::sync::OnceLock<usize>,
     /// A bit per page: committed, as far as [`Section::window`] asked.
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Bytes charged to the separate VUM physical segment admission budget.
+    vum_charge: u64,
 }
 
 impl Section {
@@ -612,7 +614,7 @@ impl Section {
                 word.load(Ordering::Acquire) & bit != 0
             })
         };
-        if lean() && done() {
+        if self.vum_charge != 0 || lean() && done() {
             return true;
         }
         if !counted(Call::Commit, || commit(base, len)) {
@@ -650,6 +652,7 @@ impl Drop for Section {
         victory_gpu::memory_audit::TITLE_SECTION_COMMIT.remove(committed * PAGE as u64);
         victory_gpu::memory_audit::TITLE_SECTION_RESERVED.remove((self.pages * PAGE) as u64);
         victory_gpu::title_memory_section_gone(self.handle as usize);
+        if self.vum_charge != 0 { VUM_POOL_RESERVED.fetch_sub(self.vum_charge, Ordering::Relaxed); }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -792,6 +795,36 @@ fn page_table_mut() -> RwLockWriteGuard<'static, Pages> {
     PAGES.write().unwrap_or_else(|e| e.into_inner())
 }
 
+static VUM_POOL_RESERVED: AtomicU64 = AtomicU64::new(0);
+
+fn physical_section(n: usize, committed: bool, charge: u64) -> Option<Arc<Section>> {
+    let size = n.checked_mul(PAGE)?;
+    let handle = unsafe {
+        CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+            PAGE_READWRITE | if committed { SEC_COMMIT } else { SEC_RESERVE },
+            (size as u64 >> 32) as u32, size as u32, std::ptr::null())
+    };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(n, committed, %error, "physical section allocation failed");
+        return None;
+    }
+    victory_gpu::title_memory_section(handle as usize,size as u64,committed);
+    victory_gpu::memory_audit::TITLE_SECTION_RESERVED.add(size as u64);
+    // Keep the old Wine accounting behavior; only our new committed
+    // candidate segments are charged for every page immediately.
+    if charge != 0 {
+        victory_gpu::memory_audit::TITLE_SECTION_COMMIT.add(size as u64);
+        victory_gpu::vum_register_pool(handle as usize,size as u64);
+    }
+    let bits = (0..n.div_ceil(64)).map(|k| {
+        let count = (n - k*64).min(64);
+        let mask = if charge == 0 { 0 } else if count == 64 { u64::MAX } else { (1u64 << count)-1 };
+        AtomicU64::new(mask)
+    }).collect();
+    Some(Arc::new(Section { handle, pages:n, window:std::sync::OnceLock::new(), committed:bits, vum_charge:charge }))
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -803,58 +836,42 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    let Some(_size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    let mut sections: Vec<Arc<Section>> = Vec::new();
+    let mut left = n;
+    // Candidate prefix only; never commit the entire multi-GiB pool.
+    // Page numbers remain contiguous/opaque; runs already split at section
+    // boundaries for map and DirectStorage. If a candidate fails, use the
+    // old reserved section for the remainder.
+    while left != 0 && victory_gpu::vum_physical_experiment() && !on_wine() {
+        let candidate = left.min((32 << 20) / PAGE);
+        let charge = (candidate * PAGE) as u64;
+        if VUM_POOL_RESERVED.fetch_update(Ordering::AcqRel,Ordering::Relaxed,|n|
+            n.checked_add(charge).filter(|&v| v <= victory_gpu::vum_physical_budget())).is_err() { break; }
+        match physical_section(candidate, true, charge) {
+            Some(section) => { sections.push(section); left -= candidate; }
+            None => { VUM_POOL_RESERVED.fetch_sub(charge,Ordering::Relaxed); break; }
+        }
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    victory_gpu::memory_audit::TITLE_SECTION_RESERVED.add(size as u64);
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
+    if left != 0 {
+        let Some(section) = physical_section(left, on_wine(), 0) else {
+            tracing::warn!(n, flags, "XMemAllocatePhysicalPages failed");
+            unsafe { count.write(0) };
+            return 0;
+        };
+        sections.push(section);
+    }
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        table.pages.insert(first + index * FRAMES, slice);
+    let mut page = first;
+    for section in sections {
+        for index in 0..section.pages {
+            table.pages.insert(page, Slice { section: section.clone(), index });
+            page += FRAMES;
+        }
     }
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.

@@ -49,7 +49,8 @@ mod inplace;
 #[cfg(windows)]
 mod vum;
 #[cfg(windows)]
-pub use vum::{allocate as vum_allocate, release as vum_release};
+pub use vum::{allocate as vum_allocate, release as vum_release, physical_experiment as vum_physical_experiment,
+    physical_budget as vum_physical_budget, register_pool as vum_register_pool};
 #[cfg(windows)]
 mod land;
 pub mod list;
