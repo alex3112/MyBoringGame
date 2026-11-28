@@ -159,6 +159,7 @@ pub(crate) struct HostHeap {
     /// The same for a slot whose descriptor is made and stays (else 0): what
     /// [`HostHeap::mirror`] asks first, without the lock. Changed under it.
     quick: Vec<std::sync::atomic::AtomicU64>,
+    physical_slots: Mutex<std::collections::BTreeMap<u32,crate::vum::MappingTicket>>,
     /// The records of the title's heap as the pass over records copied in
     /// as bytes last saw them ([`Copied::changes`]). Made on first
     /// use.
@@ -1821,6 +1822,7 @@ impl HostHeap {
                 .collect(),
             made: Made::new(count as usize),
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            physical_slots: Mutex::default(),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             texture_history: Slots::new(count as usize),
@@ -3640,7 +3642,7 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_inner(index, handle, for_draw, true)
+        self.mirror_inner(index, handle, for_draw, true, false)
     }
 
     // The sweep is the consumer of changed slots. Do not feed a slot it
@@ -3648,14 +3650,33 @@ impl HostHeap {
     // notify, including concurrent writes. Retry unresolved associations
     // explicitly in the sweep; periodic validity checks remain unchanged.
     pub(crate) fn mirror_for_buffer_sweep(&self, index: u32, handle: u64) -> Option<View> {
-        self.mirror_inner(index, handle, true, false)
+        self.mirror_inner(index, handle, true, false, false)
     }
 
     pub(crate) fn retry_buffer_sweep(&self, index: u32) {
         self.changed.put(index);
     }
 
-    fn mirror_inner(&self, index: u32, handle: u64, for_draw: bool, notify: bool) -> Option<View> {
+    /// Called only on the submission thread after settling older flights.
+    /// No in-flight persistent descriptor is overwritten on a remap.
+    pub(crate) fn stale_physical_slots(&self) -> Vec<u32> {
+        if !crate::vum::physical_experiment() { return Vec::new(); }
+        let tickets: Vec<_> = self.physical_slots.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|(&slot,&ticket)| (slot,ticket)).collect();
+        crate::vum::checked(tickets.len());
+        tickets.into_iter().filter_map(|(slot,ticket)| (!ticket.current()).then_some(slot)).collect()
+    }
+
+    pub(crate) fn rebind_physical(&self, start:u64, step:u64) {
+        let slots = self.stale_physical_slots();
+        crate::vum::rebound(slots.len());
+        for index in slots {
+            self.mirror_inner(index,start + u64::from(index)*step,true,true,true);
+            self.changed.put(index);
+        }
+    }
+
+    fn mirror_inner(&self, index: u32, handle: u64, for_draw: bool, notify: bool, force: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3678,7 +3699,7 @@ impl HostHeap {
         // asks, from five recording threads, behind one lock while another
         // held it to make a descriptor (15 % of a recording thread's time in
         // the opening, profile cpu-1).
-        if tag == VIEW_TAG
+        if !force && tag == VIEW_TAG
             && quick_mirror()
             && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
@@ -3689,6 +3710,9 @@ impl HostHeap {
         let shown = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            if crate::vum::physical_experiment() {
+                self.physical_slots.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
+            }
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if shown != 0 {
@@ -3702,7 +3726,7 @@ impl HostHeap {
             }
             return None;
         };
-        if shown != key {
+        if force || shown != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -3754,11 +3778,20 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            let capture = crate::vum::physical_experiment();
+            if capture { crate::vum::capture_begin(); }
             let kept = if later {
                 None
             } else {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
+            if capture {
+                let ticket = crate::vum::capture_end();
+                let mut slots = self.physical_slots.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(ticket) = ticket.filter(|_| kept.as_ref().is_some_and(|r| r.is_some())) {
+                    slots.insert(index,ticket);
+                } else { slots.remove(&index); }
+            }
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3798,6 +3831,13 @@ impl HostHeap {
     /// than resolving the same guest address a second time through a map
     /// that can have changed since descriptor creation.
     pub(crate) fn bound_buffer_copy(&self, index: u32, view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        if crate::vum::physical_experiment() && index < self.count {
+            let ticket = self.physical_slots.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied();
+            if let Some(ticket) = ticket && !ticket.current() {
+                crate::vum::rejected();
+                crate::host::fail(format_args!("VUM physical descriptor {} changed mapping before recording; restart with VICTORY_VUM_PHYSICAL=0",index));
+            }
+        }
         if view.is_buffer() && !matches!(view, View::Constant(..)) {
             if let Some((address, len)) = buffer_range(view)
                 && len != 0
@@ -4330,7 +4370,10 @@ fn buffer_srv(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    {
+        if crate::vum::physical_experiment() { crate::vum::capture_ticket(shadow.mapping_ticket()); }
+        Some(Some(shadow.buffer.clone()))
+    }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4454,7 +4497,10 @@ fn buffer_uav(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    {
+        if crate::vum::physical_experiment() { crate::vum::capture_ticket(shadow.mapping_ticket()); }
+        Some(Some(shadow.buffer.clone()))
+    }
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -4635,7 +4681,10 @@ fn make_twinned(
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            {
+        if crate::vum::physical_experiment() { crate::vum::capture_ticket(shadow.mapping_ticket()); }
+        Some(Some(shadow.buffer.clone()))
+    }
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;

@@ -3279,6 +3279,7 @@ struct Line {
     /// The title memory the flights' shaders and texture readbacks may write
     /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
+    physical_written: Vec<crate::vum::PhysicalSpan>,
     /// Host lists in the flights.
     lists: usize,
     /// The value signalled on the host's fence behind the last flight.
@@ -3307,6 +3308,7 @@ unsafe impl Send for Line {}
 static LINE: Mutex<Line> = Mutex::new(Line {
     line: Vec::new(),
     written: Vec::new(),
+    physical_written: Vec::new(),
     lists: 0,
     target: 0,
     settling: false,
@@ -3317,6 +3319,30 @@ static LINE: Mutex<Line> = Mutex::new(Line {
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+impl Line {
+    fn written_now(&self) -> Vec<(usize,usize)> {
+        let mut written = self.written.clone();
+        if !self.physical_written.is_empty() {
+            let aliases: Vec<_> = self.physical_written.iter().flat_map(|s| s.aliases()).collect();
+            crate::vum::alias_ranges(aliases.len());
+            join_ranges(&mut written,aliases);
+        }
+        written
+    }
+}
+
+fn physical_declared(back:&[Declared]) -> Vec<crate::vum::PhysicalSpan> {
+    if !crate::vum::physical_experiment() { return Vec::new(); }
+    let mut spans = Vec::new();
+    for (shadow,ranges) in back {
+        if let Some(ticket) = shadow.mapping_ticket() {
+            spans.extend(ranges.iter().filter_map(|&(a,b)| ticket.span(a,b)));
+        }
+    }
+    crate::vum::join_physical(&mut spans);
+    spans
+}
 
 fn line() -> std::sync::MutexGuard<'static, Line> {
     LINE.lock().unwrap_or_else(|e| e.into_inner())
@@ -3389,7 +3415,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         if line.written.is_empty() {
             return None;
         }
-        (line.written.clone(), card_steps::copies(&line))
+        (line.written_now(), card_steps::copies(&line))
     };
     blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
 }
@@ -3811,7 +3837,9 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
         if line.line.is_empty() && line.in_hand.is_empty() {
             return Some(false);
         }
-        let mut unsure = touches(&line.written, address, address + bytes);
+        let mut unsure = if line.physical_written.is_empty() {
+            touches(&line.written,address,address+bytes)
+        } else { touches(&line.written_now(),address,address+bytes) };
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
             Late::Write(at, what, n) => Some((at, what, n)),
@@ -4444,6 +4472,44 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 fn declare_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
+}
+
+// A closed native list contains GPU VAs as well as descriptors. A remap
+// cannot be repaired merely by rebinding a persistent heap slot.
+fn stale_physical_recording(runs:&[&HostList]) -> Option<crate::vum::MappingTicket> {
+    for list in runs {
+        let deferred = list.deferred();
+        let tickets = deferred.vum_held.values().filter_map(|s| s.mapping_ticket())
+            .chain(deferred.copies.iter().filter_map(|step| match step {
+                Step::GpuWrite(s,_,_) => s.mapping_ticket(),
+                _ => None,
+            }));
+        for ticket in tickets {
+            crate::vum::checked(1);
+            if !ticket.current() { return Some(ticket); }
+        }
+    }
+    None
+}
+
+fn validate_physical_recordings(runs:&[&HostList]) {
+    if let Some(ticket) = stale_physical_recording(runs) {
+        crate::vum::rejected();
+        fail(format_args!("VUM physical recording has obsolete GPU address: {ticket:?}; restart with VICTORY_VUM_PHYSICAL=0"));
+    }
+}
+
+fn physical_send_guard(runs:&[&HostList],heaps:&[usize]) -> Option<crate::watch::Reading> {
+    if !crate::vum::physical_experiment() { return None; }
+    let mapping = crate::watch::title_memory_reading();
+    let stale = stale_physical_recording(runs);
+    let stale_heap = crate::descriptor::physical_slots_stale(heaps);
+    if stale.is_some() || stale_heap {
+        drop(mapping);
+        crate::vum::rejected();
+        fail(format_args!("VUM physical binding changed before submission: {stale:?}, heap={stale_heap}; restart with VICTORY_VUM_PHYSICAL=0"));
+    }
+    Some(mapping)
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -5722,6 +5788,7 @@ impl Host {
             let Line {
                 line: items,
                 written,
+                physical_written,
                 lists,
                 settling,
                 poke,
@@ -5735,6 +5802,7 @@ impl Host {
             landing.clear();
             // What is still in the air, from the flights that are.
             written.clear();
+            physical_written.clear();
             *lists = 0;
             let mut ranges = Vec::new();
             for item in items.iter() {
@@ -5742,9 +5810,11 @@ impl Host {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
                     ranges.extend(flight.texture_back_ranges.iter().copied());
+                    if crate::vum::physical_experiment() { physical_written.extend(physical_declared(&flight.back)); }
                 }
             }
             join_ranges(written, ranges);
+            crate::vum::join_physical(physical_written);
             *settling = false;
             // The landed lists are reset, and what queues hold looked at,
             // by the helper thread (they take locks a waiter may hold).
@@ -5962,7 +6032,11 @@ impl Host {
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, physical_written, lists: flying, target, .. } = &mut *line;
+            if crate::vum::physical_experiment() {
+                physical_written.extend(physical_declared(&sent.back));
+                crate::vum::join_physical(physical_written);
+            }
             join_ranges(
                 written,
                 sent.back
@@ -6019,7 +6093,11 @@ impl Host {
         let number = sent.number;
         {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, physical_written, lists: flying, target, .. } = &mut *line;
+            if crate::vum::physical_experiment() {
+                physical_written.extend(physical_declared(&sent.back));
+                crate::vum::join_physical(physical_written);
+            }
             join_ranges(
                 written,
                 sent.back
@@ -6088,6 +6166,7 @@ impl Host {
                 }
                 line.settling = true;
                 line.written.clear();
+                line.physical_written.clear();
                 line.lists = 0;
                 std::mem::take(&mut line.line)
             };
@@ -6266,6 +6345,9 @@ impl Host {
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
+        if crate::vum::physical_experiment() {
+            validate_physical_recordings(runs);
+        }
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
@@ -6289,7 +6371,7 @@ impl Host {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
-                    blocked_by(&line.written, runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                    blocked_by(&line.written_now(), runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
                 });
             } else {
                 self.settle(&mut submitted, why);
@@ -6303,6 +6385,10 @@ impl Host {
             .flat_map(|l| l.deferred().descriptor_heaps.clone()).collect();
         descriptor_heaps.sort_unstable();
         descriptor_heaps.dedup();
+        if crate::descriptor::physical_slots_stale(&descriptor_heaps) {
+            self.settle(&mut submitted, WHY_READ);
+            crate::descriptor::rebind_physical_slots(&descriptor_heaps);
+        }
         // Keep all title heaps used by already submitted work in the
         // scope as well. If the relay has taken flights out of LINE,
         // their exact heap dependencies are not visible here: fail open
@@ -6439,7 +6525,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(1);
         // What flights in the air may write.
-        let air = line().written.clone();
+        let air = line().written_now();
         // Keep the existing planner's promoted copies and this ownership
         // path separate until their dependency models are unified.
         let owned_placed = if late && own.is_none() {
@@ -6538,6 +6624,9 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // Keep remapping out of the final validation/send window, never
+            // across a wait for the GPU or a relay landing.
+            let mapping = physical_send_guard(runs,&descriptor_heaps);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -6547,6 +6636,7 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            drop(mapping);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -6597,9 +6687,11 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            let mapping = physical_send_guard(runs,&descriptor_heaps);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                drop(mapping);
                 self.card_sent();
                 let waited = self
                     .queue

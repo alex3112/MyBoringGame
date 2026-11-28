@@ -167,9 +167,17 @@ pub(crate) fn place_for(start: u64, len: u64) -> Option<(crate::inplace::Placed,
 }
 
 pub(crate) fn overlaps(from: usize, to: usize) -> bool {
-    if from >= to || COUNT.load(Relaxed) == 0 { return false; }
-    let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    map.range(..to).next_back().is_some_and(|(&base,a)| base + a.backing.bytes > from)
+    if from >= to { return false; }
+    if COUNT.load(Relaxed) != 0 {
+        let map = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if map.range(..to).next_back().is_some_and(|(&base,a)| base + a.backing.bytes > from) {
+            return true;
+        }
+    }
+    // A legacy copy crossing a pool alias must also wait for a direct
+    // physical writer. Conservatively include partial mapped ranges.
+    physical_experiment() && POOL_COUNT.load(Relaxed) != 0
+        && crate::inplace::shown_bytes(from,to-from).is_some_and(|n| n != 0)
 }
 
 pub(crate) fn intersections(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -347,10 +355,97 @@ pub(crate) fn pool_remapping(at: usize,len: usize) -> bool {
     true
 }
 
+/// Immutable identity of a GPU binding, including its actual offset in
+/// the native buffer. Never resolve a recorded GPU address from its VA
+/// alone: a remap can keep the same resource but change the offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MappingTicket {
+    pub(crate) section: usize,
+    pub(crate) generation: u64,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    pub(crate) offset: u64,
+}
+
+impl MappingTicket {
+    pub(crate) fn current(self) -> bool {
+        crate::inplace::physical_run(self.start as usize,self.len as usize)
+            .is_some_and(|r| r.section == self.section && r.generation == self.generation && r.offset == self.offset)
+    }
+    pub(crate) fn span(self, from: usize, to: usize) -> Option<PhysicalSpan> {
+        let a = (from as u64).max(self.start);
+        let b = (to as u64).min(self.start.checked_add(self.len)?);
+        if a >= b { return None; }
+        Some(PhysicalSpan { section:self.section,generation:self.generation,
+            from:self.offset.checked_add(a-self.start)?, to:self.offset.checked_add(b-self.start)? })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PhysicalSpan {
+    section: usize,
+    generation: u64,
+    from: u64,
+    to: u64,
+}
+impl PhysicalSpan {
+    pub(crate) fn aliases(self) -> Vec<(usize,usize)> {
+        crate::inplace::physical_aliases(self.section,self.generation,self.from,self.to-self.from)
+    }
+}
+
+pub(crate) fn join_physical(spans: &mut Vec<PhysicalSpan>) {
+    spans.sort_unstable();
+    let mut kept = 0;
+    for i in 0..spans.len() {
+        let next = spans[i];
+        if kept != 0 && spans[kept-1].section == next.section
+            && spans[kept-1].generation == next.generation && next.from <= spans[kept-1].to {
+            spans[kept-1].to = spans[kept-1].to.max(next.to);
+        } else {
+            spans[kept] = next;
+            kept += 1;
+        }
+    }
+    spans.truncate(kept);
+}
+
+pub(crate) fn ticket(backing: &Backing,start: u64,len: u64,bias: u64) -> Option<MappingTicket> {
+    let (section,generation) = backing.physical?;
+    Some(MappingTicket { section,generation,start,len,offset:bias })
+}
+
 pub(crate) fn mapping_current(backing: &Backing, start: u64, len: u64, bias: u64) -> bool {
-    let Some((section,generation)) = backing.physical else { return true; };
-    crate::inplace::physical_run(start as usize,len as usize)
-        .is_some_and(|r| r.section == section && r.generation == generation && r.offset == bias)
+    ticket(backing,start,len,bias).is_none_or(MappingTicket::current)
+}
+
+// Exact capture from descriptor creation, not a second guest lookup.
+// Only persistent heap descriptors use this capture. Dynamic slots are
+// private to their recording; their retained shadows are validated below.
+thread_local! {
+    static CAPTURE: std::cell::Cell<Option<MappingTicket>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn capture_begin() { CAPTURE.set(None); }
+pub(crate) fn capture_ticket(ticket: Option<MappingTicket>) { CAPTURE.set(ticket); }
+pub(crate) fn capture_end() -> Option<MappingTicket> { CAPTURE.take() }
+
+static REMAP_STATS: [AtomicU64;4] = [const { AtomicU64::new(0) };4];
+pub(crate) fn checked(n: usize) { REMAP_STATS[0].fetch_add(n as u64,Relaxed); }
+pub(crate) fn rebound(n: usize) { REMAP_STATS[1].fetch_add(n as u64,Relaxed); }
+pub(crate) fn alias_ranges(n: usize) { REMAP_STATS[2].fetch_add(n as u64,Relaxed); }
+pub(crate) fn rejected() { REMAP_STATS[3].fetch_add(1,Relaxed); }
+
+#[cfg(test)]
+#[test]
+fn physical_ranges_join_only_within_the_same_generation() {
+    let t = MappingTicket { section:7,generation:3,start:100,len:100,offset:200 };
+    let a = t.span(90,140).unwrap();
+    let b = t.span(130,300).unwrap();
+    let other = PhysicalSpan { generation:4,..a };
+    assert!(t.span(200,201).is_none());
+    let mut ranges = vec![other,b,a];
+    join_physical(&mut ranges);
+    assert_eq!(ranges, vec![PhysicalSpan { section:7,generation:3,from:200,to:300 },other]);
 }
 
 pub(crate) fn log(frames: f64) {
@@ -362,4 +457,7 @@ pub(crate) fn log(frames: f64) {
     tracing::info!("VUM 2 physical (VICTORY_VUM_PHYSICAL={}): {} committed candidate segments, {:.2} MiB native charged; per frame {:.2} registered, {:.2} opens, {:.2} refusals, {:.2} backing reuses, {:.2} binds, {:.2} alias publications, {:.2} bound remaps",
         u8::from(physical_experiment()), POOL_COUNT.load(Relaxed), POOL_CHARGED.load(Relaxed) as f64/1048576.0,
         p[0],p[1],p[2],p[3],p[4],p[5],p[6]);
+    let q = REMAP_STATS.each_ref().map(|n| n.swap(0,Relaxed) as f64 / frames);
+    tracing::info!("VUM 2 mapping validation per frame: {:.0} tickets checked, {:.0} persistent descriptors rebound, {:.0} projected dependency ranges, {:.0} rejected stale recordings",
+        q[0],q[1],q[2],q[3]);
 }

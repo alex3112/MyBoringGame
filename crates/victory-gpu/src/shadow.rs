@@ -3363,6 +3363,10 @@ impl Shadow {
         self.vum.is_some()
     }
 
+    pub(crate) fn mapping_ticket(&self) -> Option<crate::vum::MappingTicket> {
+        crate::vum::ticket(self.vum.as_ref()?,self.start,self.len,self.place.as_ref()?.1)
+    }
+
     fn shared(start: u64, len: u64, window: bool) -> Option<Self> {
         let (placed, backing) = crate::vum::place_for(start, len)?;
         let mut shadow = Self::placed(placed, start, len, window);
@@ -5874,7 +5878,8 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
-    if let Some(shared) = Shadow::shared(start, len, true) {
+    if let Some(shared) = Shadow::shared(start, len, true)
+        && shared.offset(start) == 0 {
         return Some(publish_shadow(shared));
     }
     let host = host()?;

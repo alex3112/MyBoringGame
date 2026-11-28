@@ -688,7 +688,13 @@ impl Host {
             if line.written.is_empty() {
                 return None;
             }
-            (line.written.clone(), copies(&line))
+            // The promotion path works on virtual-address card mirrors.
+            // A direct physical writer must first satisfy alias-aware CPU
+            // dependencies, not be promoted as if it were a stale mirror.
+            if !line.physical_written.is_empty() {
+                return None;
+            }
+            (line.written_now(), copies(&line))
         };
         // A shared backing is not a stale RAM mirror that can be filled
         // through a carded copy. Keep the existing wait for CPU consumers

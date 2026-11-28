@@ -557,18 +557,27 @@ pub(crate) fn physical_aliases(section: usize, generation: u64, from: u64, len: 
     let v = views();
     if !v.sections.iter().any(|s| s.0 == section && s.3 == generation) { return Vec::new(); }
     let Some(to) = from.checked_add(len) else { return Vec::new(); };
-    let mut out: Vec<(usize,usize)> = Vec::new();
-    for (&base, &(bytes, handle, offset)) in &v.views {
-        if handle != section { continue; }
-        let a = offset.max(from);
-        let b = offset.saturating_add(bytes as u64).min(to);
-        if a >= b { continue; }
-        let start = base + (a - offset) as usize;
-        let end = base + (b - offset) as usize;
-        if let Some(last) = out.last_mut() && last.1 == start { last.1 = end; }
-        else { out.push((start,end)); }
+    let mut out = Vec::new();
+    if from >= to { return out; }
+    let mut page = from & !(K64 as u64 - 1);
+    while page < to {
+        let a = from.max(page) - page;
+        let b = to.min(page.saturating_add(K64 as u64)) - page;
+        if let Some(shown) = v.pages.get(&(section,page)) {
+            for &base in shown {
+                out.push((base + a as usize,base + b as usize));
+            }
+        }
+        let Some(next) = page.checked_add(K64 as u64) else { break; };
+        page = next;
     }
-    out
+    out.sort_unstable();
+    let mut joined: Vec<(usize,usize)> = Vec::new();
+    for (a,b) in out {
+        if let Some(last) = joined.last_mut() && a <= last.1 { last.1 = last.1.max(b); }
+        else { joined.push((a,b)); }
+    }
+    joined
 }
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.

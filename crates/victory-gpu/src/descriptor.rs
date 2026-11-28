@@ -315,6 +315,30 @@ fn scoped_heaps() -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) fn physical_slots_stale(scope:&[usize]) -> bool {
+    if !crate::vum::physical_experiment() { return false; }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_,_,at)| {
+        let heap = unsafe { &*(at as *const Heap) };
+        let Some(Some(host)) = heap.host.get() else { return false; };
+        let native = windows::core::Interface::as_raw(&host.heap) as usize;
+        scope.binary_search(&native).is_ok() && !host.stale_physical_slots().is_empty()
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn rebind_physical_slots(scope:&[usize]) {
+    if !crate::vum::physical_experiment() { return; }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(start,_,at) in heaps.iter() {
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)),Some(step)) = (heap.host.get(),increment(heap.desc.kind)) else { continue; };
+        let native = windows::core::Interface::as_raw(&host.heap) as usize;
+        if scope.binary_search(&native).is_ok() { host.rebind_physical(start,u64::from(step)); }
+    }
+}
+
+#[cfg(windows)]
 fn sync_heaps_scoped(scope: Option<&[usize]>) {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
