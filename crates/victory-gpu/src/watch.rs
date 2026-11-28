@@ -2664,6 +2664,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::vum::homes::invalidate();
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2717,6 +2718,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    crate::vum::homes::invalidate();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

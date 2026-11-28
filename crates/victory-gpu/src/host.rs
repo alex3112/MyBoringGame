@@ -4058,6 +4058,8 @@ struct RelayFetch {
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
     had: crate::land::Had,
+    home_snapshot: Option<crate::vum::homes::Snapshot>,
+    home_snapshot_tried: bool,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -4316,6 +4318,7 @@ fn late_line(frames: f64) {
     }
     crate::land::log(frames);
     crate::land::gpu_homes_line(frames);
+    crate::vum::homes::line(frames);
     if relay() {
         release_line(frames);
         let counts = FETCH_COPY_STATS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5331,6 +5334,8 @@ impl Host {
                 buffer,
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
+                home_snapshot: None,
+                home_snapshot_tried: false,
             })
         }
     }
@@ -5393,6 +5398,12 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
+                            if crate::vum::homes::writeback_on() && land::on()
+                                && r.shadow.home_published(behind, lo, hi)
+                            {
+                                crate::vum::homes::reused((hi - lo) as u64);
+                                continue;
+                            }
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
                                 land::count(land::stat::HAD_BYTES, (hi - lo) as u64);
@@ -5444,6 +5455,7 @@ impl Host {
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.0.sent_as).max().unwrap_or(0);
+        let last_producer = plans.iter().map(|p| p.1).max().unwrap_or(0);
         if pieces.is_empty() {
             // Nothing to fetch: every send so far is older than the next
             // fetch, if that goes to the queue the sends went to.
@@ -5515,6 +5527,41 @@ impl Host {
             f.sent += 1;
             let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
             let copy_queue = f.queue.clone();
+            // The new route pays for a local GPU snapshot only if a later
+            // already-completed producer overlaps this landing. This avoids
+            // waiting behind an entire frame of unfinished graphics work
+            // (the reason the legacy direct-queue fetch was abandoned).
+            let home_ahead = if crate::vum::homes::writeback_on() && land::on()
+                && copy_queue.is_some() && !check_on && !upcheck::on()
+                && pieces.iter().all(|(s, ..)| s.card_local())
+            {
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                let queued = line();
+                let target = queued.target;
+                if target > last_producer && completed >= target
+                    && queued.line.iter().any(|item| match item {
+                        Late::Run(flight) if flight.fence > last_producer && flight.fence <= target => {
+                            flight.back.iter().any(|(s, ranges)| {
+                                pieces.iter().any(|(home, lo, hi, _)| {
+                                    std::sync::Arc::ptr_eq(s, home) && ranges.iter().any(|&(a,b)| {
+                                        a < home.span().0 as usize + *hi && home.span().0 as usize + *lo < b
+                                    })
+                                })
+                            })
+                        }
+                        _ => false,
+                    })
+                { target } else { 0 }
+            } else { 0 };
+            if home_ahead != 0 && !f.home_snapshot_tried {
+                f.home_snapshot_tried = true;
+                f.home_snapshot = crate::vum::homes::Snapshot::new(&self.device, capacity, || self.uav_buffer(capacity));
+            }
+            let snapshot = f.home_snapshot.as_ref().filter(|s| home_ahead != 0 && s.capacity() >= total);
+            let publication = snapshot.and_then(|_| crate::vum::homes::PublicationEpoch::new(home_ahead));
+            // An ongoing guest remap invalidates this attempt, before any
+            // command is recorded. Keep the ordinary fetch in that case.
+            let snapshot = snapshot.filter(|_| publication.is_some());
             let waiting = std::time::Instant::now();
             // The flights the fetch runs behind: those in the line by now have
             // been given to the queue. On the copy queue, those landed here.
@@ -5530,6 +5577,10 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
                     let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                    if let Some(snapshot) = snapshot {
+                        snapshot.begin()?;
+                    }
+                    let (copy_list, destination) = snapshot.map_or((&list, &buffer), |s| (s.list(), s.buffer()));
                     let mut i = 0;
                     let mut commands = 0;
                     while i < copies.len() {
@@ -5550,16 +5601,32 @@ impl Host {
                                 next += 1;
                             }
                         }
-                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (end - *lo) as u64);
+                        copy_list.CopyBufferRegion(destination, *at, &shadow.buffer, *lo as u64, (end - *lo) as u64);
                         i = next;
                         commands += 1;
                     }
                     FETCH_COPY_STATS[0].fetch_add(copies.len() as u64, Ordering::Relaxed);
                     FETCH_COPY_STATS[1].fetch_add(commands, Ordering::Relaxed);
+                    if let Some(snapshot) = snapshot {
+                        snapshot.close()?;
+                        // One contiguous PCIe copy from a stable device-local
+                        // snapshot; later graphics work can continue without
+                        // racing reads of the original homes.
+                        list.CopyBufferRegion(&buffer, 0, snapshot.buffer(), 0, total);
+                    }
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     let _fetching = crate::timeline::span("landing: fetching pieces");
                     if let Some(queue) = &copy_queue {
+                        let after = if let Some(snapshot) = snapshot {
+                            let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                            snapshot.enqueue(&self.queue, queue, sent)?;
+                            let after = *order;
+                            drop(order);
+                            self.card_sent();
+                            crate::vum::homes::snapshot_sent(total);
+                            after
+                        } else { behind };
                         queue.ExecuteCommandLists(&lists);
                         queue.Signal(&fence, sent)?;
                         meanwhile();
@@ -5570,7 +5637,7 @@ impl Host {
                             return Err(windows::core::Error::from_thread());
                         }
                         self.device.GetDeviceRemovedReason()?;
-                        return Ok(behind);
+                        return Ok(after);
                     }
                     // In the order of the queue: the sends of title bytes so
                     // far are ahead of this fetch, every later one behind it.
@@ -5627,7 +5694,7 @@ impl Host {
                         // SAFETY: the mapping of the fetched bytes, `total` of
                         // them; the copy into it has run, and the next waits
                         // for this call.
-                        put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+                        put.fetch_add(unsafe { run[0].0.land_home(&addressed, after, &mut notes, publication) }, Ordering::Relaxed);
                     }
                     notes.flush();
                     land::spent(land::stat::CARD_ALL, working);
@@ -5666,7 +5733,11 @@ impl Host {
                 }
             }
             // Keep the send history until every batch has been merged.
-            after_all = after_all.min(after);
+            // A snapshot may be newer than the next ordinary copy-queue
+            // fetch. Do not advance the global retirement watermark past
+            // the producers of this landing just because this one snapshot
+            // ran behind later sends.
+            after_all = after_all.min(if copy_queue.is_some() { behind.min(after) } else { after });
             first = last;
         }
         if let Some(f) = fetch.as_mut() {

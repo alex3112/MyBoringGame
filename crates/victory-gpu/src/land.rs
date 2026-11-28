@@ -95,7 +95,7 @@ pub(crate) fn gpu_home_reuse(local: bool, direct: bool, bytes: u64) -> bool {
 pub(crate) fn gpu_homes_line(frames: f64) {
     let [pieces, bytes] = GPU_HOMES_REUSE.each_ref()
         .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
-    tracing::info!("GPU homes phase 1 (VICTORY_GPU_HOMES={}): {:.0} proven redundant readback requests avoided/frame, {:.2} MiB/frame logical coverage; persistent ownership disabled",
+    tracing::info!("GPU homes phase 1 (VICTORY_GPU_HOMES={}): {:.0} proven redundant readback requests avoided/frame, {:.2} MiB/frame logical coverage; direct-queue legacy proof",
         u8::from(gpu_homes_on()), pieces, bytes / 1048576.0);
 }
 
@@ -530,6 +530,8 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    missing: u64,
+    home_publications: Vec<(*const crate::shadow::Shadow, usize, usize, crate::vum::homes::PublicationEpoch)>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -561,9 +563,24 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
+    pub(crate) fn missing(&self) -> u64 { self.missing }
+
+    pub(crate) fn home_published(&mut self, copy: &crate::shadow::Shadow, lo: usize, hi: usize, epoch: crate::vum::homes::PublicationEpoch) {
+        self.home_publications.push((copy, lo, hi, epoch));
+    }
+
+    fn publish_homes(&mut self) {
+        for (copy, lo, hi, epoch) in self.home_publications.drain(..) {
+            // SAFETY: the landing job holds its Shadow refs until flush,
+            // just as for the existing landed pointers above.
+            unsafe { &*copy }.publish_home(lo, hi, epoch);
+        }
+    }
+
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
         if self.pages.is_empty() {
+            self.publish_homes();
             return;
         }
         let noting = std::time::Instant::now();
@@ -585,6 +602,7 @@ impl Notes {
         self.pages.clear();
         self.spans.clear();
         self.landed.clear();
+        self.publish_homes();
         spent(stat::NOTES, noting);
     }
 }
@@ -718,6 +736,7 @@ unsafe fn piece_at(
     count(stat::NEW_BLOCKS, blocks);
     count(stat::DWORDS, dwords);
     count(stat::MISSING, missing);
+    notes.missing += missing;
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4

@@ -6,6 +6,7 @@
 //! pool rendering stays on the legacy path pending descriptor rebinding.
 
 pub(crate) mod virtual_address;
+pub(crate) mod homes;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

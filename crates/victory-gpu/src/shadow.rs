@@ -23,6 +23,9 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+use crate::vum::homes::{Coherence, Home};
+#[cfg(test)]
+use crate::vum::homes::{Flights, Ownership, SentRuns};
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -50,13 +53,8 @@ pub(crate) struct Shadow {
     ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Ownership>,
-    /// With [`relay`]: how many submissions not yet copied back declared
-    /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
-    /// lock.
-    flights: Mutex<Flights>,
+    /// Per-allocation VUM producer ownership, also for the RAM fallback.
+    coherence: Coherence,
     /// The copy's bytes before the submission ran, for the ranges its
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
@@ -88,7 +86,7 @@ pub(crate) struct Shadow {
     id: u64,
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
-    card: Option<Card>,
+    card: Option<Home>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
@@ -103,61 +101,6 @@ pub(crate) struct Shadow {
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     vum: Option<Arc<crate::vum::Backing>>,
-}
-
-/// The live GPU-write ownership of one native allocation. The exact
-/// declarations are retained for Flights' producer counts. The disjoint
-/// coverage is derived from those declarations at the same lock boundary,
-/// never inferred from a guest address or from a completed GPU fence.
-#[derive(Default)]
-struct Ownership {
-    exact: Vec<(usize, usize)>,
-    covered: Vec<(usize, usize)>,
-}
-
-impl Ownership {
-    fn push(&mut self, range: (usize, usize)) {
-        self.exact.push(range);
-        let (mut from, mut to) = range;
-        if from >= to { return; }
-        let first = self.covered.partition_point(|r| r.1 < from);
-        let mut last = first;
-        while last < self.covered.len() && self.covered[last].0 <= to {
-            from = from.min(self.covered[last].0);
-            to = to.max(self.covered[last].1);
-            last += 1;
-        }
-        self.covered.splice(first..last, [(from, to)]);
-    }
-
-    fn retain(&mut self, mut keep: impl FnMut(&(usize, usize)) -> bool) {
-        let before = self.exact.len();
-        self.exact.retain(|r| keep(r));
-        if self.exact.len() != before {
-            self.covered = joined(self.exact.iter().copied().filter(|r| r.0 < r.1).collect());
-        }
-    }
-
-    fn iter(&self) -> std::slice::Iter<'_, (usize, usize)> { self.exact.iter() }
-    fn contains(&self, range: &(usize, usize)) -> bool { self.exact.contains(range) }
-    fn is_empty(&self) -> bool { self.exact.is_empty() }
-
-    fn overlaps(&self, from: usize, to: usize) -> &[(usize, usize)] {
-        let first = self.covered.partition_point(|r| r.1 <= from);
-        let last = first + self.covered[first..].partition_point(|r| r.0 < to);
-        &self.covered[first..last]
-    }
-
-    fn gaps(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
-        let mut gaps = Vec::new();
-        let mut at = from;
-        for &(a, b) in self.overlaps(from, to) {
-            if at < a { gaps.push((at, a.min(to))); }
-            at = at.max(b);
-        }
-        if at < to { gaps.push((at, to)); }
-        gaps
-    }
 }
 
 fn versioned_ownership() -> bool {
@@ -192,36 +135,6 @@ fn ownership_preserves_overlapping_producers() {
     assert_eq!(o.gaps(20, 60), [(20, 60)]);
 }
 
-/// What a copy in the card's memory ([`cards`]) has beside the buffer
-/// shaders see.
-struct Card {
-    /// This allocation was created in a device-local DEFAULT heap.
-    local: bool,
-    /// The CPU's side, in the PC's memory: what `data` maps. Title memory
-    /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
-    /// The card side's bytes as they were when the submission's shaders
-    /// started, in the card's memory too: made when shader writes are
-    /// first declared for the copy, and compared with the card's side, on
-    /// the card, after each submission that declares some.
-    before: Mutex<Option<ID3D12Resource>>,
-    /// Offsets of the copy whose bytes changed on the CPU's side and have
-    /// not gone to the card's side yet.
-    dirty: Mutex<Vec<(usize, usize)>>,
-    /// With [`relay`]: the offsets that went from `dirty` to the card's
-    /// side, each with the number of the send that took it
-    /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
-    /// Locked inside `dirty`'s lock.
-    sent: Mutex<SentRuns>,
-    /// Whether something was put into `dirty` since it was last taken.
-    touched: std::sync::atomic::AtomicBool,
-    // Weak self-identity installed before publishing a resident copy.
-    owner: std::sync::OnceLock<std::sync::Weak<Shadow>>,
-    /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
-    size: u64,
-}
-
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
 /// list went from 50.5 to 4.5 ms on the card; `VICTORY_CARD_BUFFERS=0`
@@ -239,12 +152,12 @@ struct Card {
 ///
 /// With the switch, a title buffer of [`card_limits`]' size or more has two
 /// sides. Shaders see `Shadow::buffer`, in the card's memory. The CPU's
-/// side (`Card::staging`, what `Shadow::data` maps) takes title memory as
+/// side (`Home::staging`, what `Shadow::data` maps) takes title memory as
 /// before, and the ranges that changed in it are copied to the card's side
 /// before each submission (`Host::card_before`). What shaders wrote is
 /// found on the card: after the submission's lists a compute pass of ours
 /// compares each declared range, by 64 KiB piece, with the card side's
-/// bytes from before (`Card::before`), and only the pieces that differ are
+/// bytes from before (`Home::before`), and only the pieces that differ are
 /// fetched and merged into title memory, byte by byte as
 /// [`Shadow::copy_back`] does (`Host::card_back`, [`Shadow::card_merge`]).
 /// No snapshot is taken and nothing is compared on the CPU for such a copy.
@@ -766,51 +679,6 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
-/// What went up, by send: its number, and the offsets, in order and joined
-/// (a refresh sends thousands of runs of a few words).
-#[derive(Default)]
-struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
-
-impl SentRuns {
-    #[cfg(test)]
-    fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
-        self.note_joined(number, joined(ranges));
-    }
-
-    /// `ranges` are in order and joined.
-    fn note_joined(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
-        if ranges.is_empty() {
-            return;
-        }
-        match self.0.iter_mut().find(|s| s.0 == number) {
-            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
-            None => self.0.push((number, ranges)),
-        }
-    }
-
-    /// Sends up to `number` are of no use any more.
-    fn forget(&mut self, number: u64) {
-        self.0.retain(|s| s.0 > number);
-    }
-
-    /// Adds to `out` what sends after `number` took of `[from, to)`.
-    fn near(&self, number: u64, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
-        for (_, ranges) in self.0.iter().filter(|s| s.0 > number) {
-            let first = ranges.partition_point(|r| r.1 <= from);
-            out.extend(ranges[first..].iter().take_while(|r| r.0 < to).copied());
-        }
-    }
-
-    #[cfg(test)]
-    fn of(all: &[(usize, usize, u64)]) -> SentRuns {
-        let mut sent = SentRuns::default();
-        for &(a, b, number) in all {
-            sent.note(number, vec![(a, b)]);
-        }
-        sent
-    }
-}
-
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -839,19 +707,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let Some(shadow) = weak.upgrade() else { continue; };
         let Some(card) = &shadow.card else { continue; };
         if !card.touched.load(Ordering::Acquire) { continue; }
-        let ranges = {
-            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            // Clear under the same lock as insertion. A producer racing
-            // this take either belongs to this version or enqueues anew.
-            card.touched.store(false, Ordering::Release);
-            let ranges = joined(std::mem::take(&mut *dirty));
-            if relay() {
-                let mut sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-                sent.forget(fetched);
-                sent.note_joined(sent_as, ranges.clone());
-            }
-            ranges
-        };
+        let ranges = card.take_uploads(relay(), sent_as, fetched);
         if !ranges.is_empty() {
             DIRTY_CARD_STATS[2].fetch_add(1, Ordering::Relaxed);
             out.push((shadow, ranges));
@@ -945,7 +801,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             continue;
         }
         let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+            shadow.coherence.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -1164,47 +1020,6 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
-/// With [`relay`]: how many submissions that are not copied back yet
-/// declared each range shaders may be writing (range, count, the last
-/// submission that declared it).
-///
-/// Without it a range declared by two flights was one entry, and the end
-/// of the first flight's copy-back removed it while the second was still
-/// writing: the next refresh would have put title bytes over what the
-/// second flight's shaders were writing.
-#[derive(Default)]
-struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
-
-impl Flights {
-    /// Submission `number` declares `range`: counted once for it, however
-    /// often it declares it.
-    fn declare(&mut self, range: (usize, usize), number: u64) {
-        let f = self.0.entry(range).or_insert((0, number));
-        if f.0 == 0 || f.1 != number {
-            *f = (f.0 + 1, number);
-        }
-    }
-
-    /// One submission that declared `ranges` (each once) is copied back:
-    /// the ranges no other submission still holds, in order.
-    fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
-        let mut free = Vec::new();
-        for range in ranges {
-            match self.0.get_mut(range) {
-                Some(f) if f.0 > 1 => f.0 -= 1,
-                Some(_) => {
-                    self.0.remove(range);
-                    free.push(*range);
-                }
-                // Not counted (declared before anything counted): free.
-                None => free.push(*range),
-            }
-        }
-        free.sort_unstable();
-        free
-    }
-}
-
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
@@ -1274,7 +1089,7 @@ mod relay_tests {
         flights.declare(a, 9);
         assert_eq!(flights.done(&[a]), vec![]);
         assert_eq!(flights.done(&[a]), vec![a]);
-        assert!(flights.0.is_empty());
+        assert!(flights.is_empty());
         // The later flight first: the same.
         flights.declare(a, 1);
         flights.declare(a, 2);
@@ -3446,8 +3261,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
-            pending: Mutex::default(),
-            flights: Mutex::default(),
+            coherence: Coherence::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
             kept: Mutex::default(),
@@ -3511,11 +3325,11 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
         if relay() {
-            self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
+            self.coherence.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
@@ -3837,9 +3651,9 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
-            let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
+            let free = self.coherence.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
             pending.retain(|r| free.binary_search(r).is_err());
         } else {
             pending.retain(|r| !ranges.contains(r));
@@ -3906,13 +3720,13 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        !self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
         if versioned_ownership() {
             from < to && !pending.overlaps(from, to).is_empty()
         } else {
@@ -3938,7 +3752,7 @@ impl Shadow {
             return false;
         }
         let busy: Vec<(usize, usize)> = {
-            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
             if versioned_ownership() && crate::watch::light() {
                 pending.overlaps(from, to).iter().map(|&(a,e)| (a.max(from), e.min(to))).collect()
             } else {
@@ -3983,7 +3797,7 @@ impl Shadow {
             return false;
         }
         let busy: Vec<(usize, usize)> = {
-            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
             if versioned_ownership() && crate::watch::light() {
                 pending.overlaps(from, to).iter().map(|&(a,e)| (a.max(from), e.min(to))).collect()
             } else {
@@ -4183,7 +3997,7 @@ impl Shadow {
         if versioned_ownership() && crate::watch::light() {
             VERSIONED[0].fetch_add(1, Ordering::Relaxed);
             let gaps = {
-                let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let pending = self.coherence.pending.lock().unwrap_or_else(|e| e.into_inner());
                 if pending.overlaps(from, to).is_empty() {
                     None
                 } else {
@@ -4207,8 +4021,7 @@ impl Shadow {
             }
             return self.update_free(from, to);
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
+        let mut busy: Vec<(usize, usize)> = self.coherence.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
@@ -4632,6 +4445,19 @@ impl Shadow {
         self.card.as_ref().is_some_and(|card| card.local)
     }
 
+    /// A native home has already published every byte of this interval
+    /// behind this producer. Never infer this from GPU completion alone.
+    pub(crate) fn home_published(&self, fence: u64, lo: usize, hi: usize) -> bool {
+        self.card.as_ref().is_some_and(|home| home.local && lo < hi
+            && home.published(self.card_piece_of(lo), lo, hi, fence))
+    }
+
+    pub(crate) fn publish_home(&self, lo: usize, hi: usize, epoch: crate::vum::homes::PublicationEpoch) {
+        if let Some(home) = &self.card && home.local && lo < hi {
+            home.publish(self.card_piece_of(lo), lo, hi, epoch);
+        }
+    }
+
     /// Shaders store in it what is not declared: from here on only the dwords
     /// the title changes go up ([`by_address`]).
     pub(crate) fn keep_stores(&self) {
@@ -4658,20 +4484,12 @@ impl Shadow {
         if runs.peek().is_none() {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        for (from, to) in runs {
-            match dirty.last_mut() {
-                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-                _ => dirty.push((from, to)),
+        card.cpu_changed(runs, || {
+            if dirty_queue() && let Some(owner) = card.owner.get() {
+                DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()).push(owner.clone());
+                DIRTY_CARD_STATS[0].fetch_add(1, Ordering::Relaxed);
             }
-        }
-        // (Under the lock: what takes the list sees it or finds it set.)
-        if !card.touched.swap(true, Ordering::AcqRel) && dirty_queue()
-            && let Some(owner) = card.owner.get()
-        {
-            DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner()).push(owner.clone());
-            DIRTY_CARD_STATS[0].fetch_add(1, Ordering::Relaxed);
-        }
+        });
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4928,13 +4746,7 @@ impl Shadow {
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
-            sent.near(fetched_after, at, at + n, &mut skip);
-            skip
-        };
+        let skip = card.newer_cpu_bytes(fetched_after, at, at + n);
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
@@ -4963,16 +4775,7 @@ impl Shadow {
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
-            shadow.card = Some(Card {
-                local: false,
-                staging: none(),
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                owner: Default::default(),
-                size: len.next_multiple_of(PIECE as u64),
-            });
+            shadow.card = Some(Home::new(false, none(), len.next_multiple_of(PIECE as u64)));
         }
         let shadow = Arc::new(shadow);
         std::mem::forget(shadow.clone());
@@ -5018,6 +4821,14 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        // SAFETY: identical requirements; ordinary fetches make no proof.
+        unsafe { self.land_home(pieces, fetched_after, notes, None) }
+    }
+
+    /// The same merge, for a queue-ordered home snapshot. Record an exact
+    /// CPU-publication proof only when none of the bytes were excluded or
+    /// missing. The proof is committed by Notes after its journal writes.
+    pub(crate) unsafe fn land_home(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes, publication: Option<crate::vum::homes::PublicationEpoch>) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
@@ -5025,13 +4836,7 @@ impl Shadow {
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
-        let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
-            sent.near(fetched_after, from, to, &mut skip);
-            skip
-        };
+        let skip = card.newer_cpu_bytes(fetched_after, from, to);
         let mut put = 0;
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
@@ -5044,8 +4849,15 @@ impl Shadow {
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
+            let failed_before = notes.missing();
             let merged =
                 unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+            if let Some(epoch) = publication
+                && card.local && parts.as_slice() == [(0, hi - lo)]
+                && notes.missing() == failed_before
+            {
+                notes.home_published(self, lo, hi, epoch);
+            }
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -5117,7 +4929,7 @@ impl Shadow {
 
 #[cfg(test)]
 mod land_tests {
-    use super::{Card, PIECE, Shadow};
+    use super::{Home, PIECE, Shadow};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -5128,16 +4940,7 @@ mod land_tests {
         // SAFETY: the mapping, `len` bytes.
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
-        shadow.card = Some(Card {
-            local: false,
-            staging: buffer,
-            before: Mutex::default(),
-            dirty: Mutex::default(),
-            sent: Mutex::default(),
-                touched: Default::default(),
-                owner: Default::default(),
-            size: len as u64,
-        });
+        shadow.card = Some(Home::new(false, buffer, len as u64));
         Some(shadow)
     }
 
@@ -5244,7 +5047,7 @@ mod land_tests {
         let Some(shadow) = copy_of(title, LEN) else {
             return; // no host GPU
         };
-        shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.coherence.pending.lock().unwrap().push((title, title + LEN));
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5686,16 +5489,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     len, local,
                     "a buffer's host copy has two sides"
                 );
-                let card = Card {
-                    local,
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                owner: Default::default(),
-                    size,
-                };
+                let card = Home::new(local, buffer, size);
                 (on_card, Some(card))
             }
             None => (buffer, None),
@@ -5926,16 +5720,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
-    shadow.card = Some(Card {
-        local,
-        staging,
-        before: Mutex::default(),
-        dirty: Mutex::default(),
-        sent: Mutex::default(),
-        touched: Default::default(),
-                owner: Default::default(),
-        size: len,
-    });
+    shadow.card = Some(Home::new(local, staging, len));
     let shadow = publish_shadow(shadow);
     register_card(&shadow);
     Some(shadow)
@@ -6123,16 +5908,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (buffer, card) = match window_card_for(len) {
         Some((on_card, local)) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                local,
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                touched: Default::default(),
-                owner: Default::default(),
-                size: len,
-            };
+            let card = Home::new(local, buffer, len);
             (on_card, Some(card))
         }
         None => (buffer, None),
