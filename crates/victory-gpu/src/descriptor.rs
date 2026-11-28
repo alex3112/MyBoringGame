@@ -391,20 +391,32 @@ fn sync_heaps_scoped(scope: Option<&[usize]>) {
         let old_slots = std::time::Instant::now();
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+        let old_worker_us = std::sync::atomic::AtomicU64::new(0);
+        let old_finished_us = std::sync::atomic::AtomicU64::new(0);
+        let old_jobs = before.len().div_ceil(SYNC_AT_A_TIME);
+        // No physical remap experiment: its ordering stays on the legacy path.
+        let pipelined = heap_pipeline() && old_jobs > 0 && !crate::vum::physical_experiment();
+        let process_old = |n: usize| {
+            let began = std::time::Instant::now();
+            let mut table_count = 0u64;
             for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
-                    of_tables.fetch_add(1, Relaxed);
+                    table_count += 1;
                 } else {
                     host.mirror(index, start + u64::from(index) * step, false);
                 }
             }
-        });
-        let of_tables = of_tables.into_inner();
-        tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
-        old_slots_us += old_slots.elapsed().as_micros() as u64;
+            // One atomic per chunk rather than one contended atomic per slot.
+            of_tables.fetch_add(table_count, Relaxed);
+            if pipelined {
+                old_worker_us.fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+                old_finished_us.fetch_max(old_slots.elapsed().as_micros() as u64, Relaxed);
+            }
+        };
+        if !pipelined {
+            crate::land::each_view(true, old_jobs, &process_old);
+            old_slots_us += old_slots.elapsed().as_micros() as u64;
+        }
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
@@ -425,7 +437,9 @@ fn sync_heaps_scoped(scope: Option<&[usize]>) {
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
         let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
-        crate::land::each_view(true, found.len(), &|n| {
+        let scan_worker_us = std::sync::atomic::AtomicU64::new(0);
+        let scan_job = |n: usize| {
+            let job_began = std::time::Instant::now();
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut batch_bytes: Vec<u8> = Vec::new();
@@ -483,44 +497,57 @@ fn sync_heaps_scoped(scope: Option<&[usize]>) {
                                 .and_then(|b| b.try_into().ok())
                                 .map_or(0, u32::from_le_bytes)
                         };
-                        if !samplers && word(0) == VIEW_TAG {
-                            // A draw's own table: the draw makes what it
-                            // reads of it (`draw.rs` `tables`).
-                            if host.copied_tabled(index, frame) {
-                                out.tabled += 1;
-                                continue;
-                            }
-                            // Buffer views and placed textures get no host
-                            // slot from this anyway, they wait for a draw
-                            // or a pass: noted some frames on, unless a
-                            // draw's table turns out to hold them.
-                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
-                                out.wait.push(index);
-                                continue;
-                            }
-                        }
-                        // No view, in a slot that shows none: nothing to make or
-                        // unmake (32,000 of 41,000 a frame on the water, run
-                        // b2-water).
-                        if word(0) != VIEW_TAG && host.shows_none(index) {
-                            out.nothing += 1;
-                            continue;
-                        }
-                        out.make.push(index);
-                        out.kinds[if samplers {
-                            3
-                        } else if word(0) != VIEW_TAG {
-                            0
-                        } else if word(2) >> KIND_SHIFT == 0 {
-                            1
+                        let record = (index, word(0), word(2) >> KIND_SHIFT);
+                        if pipelined {
+                            // Raw comparison is independent of host mirrors.
+                            // Classification (especially shows_none) is not.
+                            out.pending_records.push(record);
                         } else {
-                            2
-                        }] += 1;
+                            classify_record(host, frame, samplers, record, &mut out);
+                        }
                     }
                 }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
-        });
+            if pipelined { scan_worker_us.fetch_add(job_began.elapsed().as_micros() as u64, Relaxed); }
+        };
+        if pipelined {
+            // The guest publishes the records used by a submission before
+            // submitting it. Both work groups only read guest heap records;
+            // the old group writes host descriptors, while the scan updates
+            // the separate copied-record cache. Writes after written.take
+            // remain in the write-watch journal for the next round.
+            // Interleave to avoid leaving all page reads at the tail.
+            let mixed = std::time::Instant::now();
+            crate::land::each_view(true, old_jobs + found.len(), &|n| {
+                match heap_pipeline_job(n, old_jobs, found.len()) {
+                    (true, i) => process_old(i),
+                    (false, i) => scan_job(i),
+                }
+            });
+            let mixed_us = mixed.elapsed().as_micros() as u64;
+            // No new-slot classification or mirroring before all aged
+            // mirrors finish: preserve their effects on host slot state.
+            let classified = std::time::Instant::now();
+            crate::land::each_view(true, found.len(), &|n| {
+                let mut part = found[n].lock().unwrap_or_else(|e| e.into_inner());
+                for record in std::mem::take(&mut part.pending_records) {
+                    classify_record(host, frame, samplers, record, &mut part);
+                }
+            });
+            for (counter, value) in HEAP_PIPELINE_STATS.iter().zip([
+                1, old_jobs as u64, found.len() as u64, mixed_us,
+                old_worker_us.load(Relaxed), scan_worker_us.load(Relaxed),
+                classified.elapsed().as_micros() as u64,
+            ]) { counter.fetch_add(value, Relaxed); }
+            old_slots_us += old_finished_us.load(Relaxed);
+        } else {
+            crate::land::each_view(true, found.len(), &scan_job);
+        }
+        let of_tables = of_tables.into_inner();
+        tabled += of_tables;
+        mirrored += before.len() as u64 - of_tables;
+        kinds[4] += before.len() as u64 - of_tables;
         drop(copied);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -589,6 +616,63 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    // Only used while old mirrors and raw scans run in parallel.
+    pending_records: Vec<(u32, u32, u32)>,
+}
+
+// The snapshot tag/kind are the same ones used by the legacy scan.
+// The host state is observed only after the preceding aged mirrors.
+#[cfg(windows)]
+fn classify_record(host: &host::HostHeap, frame: u64, samplers: bool, (index, tag, kind): (u32, u32, u32), out: &mut SyncPart) {
+    if !samplers && tag == VIEW_TAG {
+        if host.copied_tabled(index, frame) {
+            out.tabled += 1;
+            return;
+        }
+        if matches!(kind, CONSTANT | PLACED) && host.copied_waits() {
+            out.wait.push(index);
+            return;
+        }
+    }
+    if tag != VIEW_TAG && host.shows_none(index) {
+        out.nothing += 1;
+        return;
+    }
+    out.make.push(index);
+    out.kinds[if samplers { 3 } else if tag != VIEW_TAG { 0 } else if kind == 0 { 1 } else { 2 }] += 1;
+}
+
+#[cfg(windows)]
+fn heap_pipeline() -> bool {
+    crate::toggled!("VICTORY_HEAP_PIPELINE")
+}
+
+#[cfg(windows)]
+static HEAP_PIPELINE_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+// Interleave independent scan and old-slot tasks, then drain the longer
+// group. True identifies the old-slot group.
+#[cfg(windows)]
+fn heap_pipeline_job(n: usize, old: usize, scan: usize) -> (bool, usize) {
+    let both = old.min(scan);
+    if n < both * 2 {
+        (n % 2 == 0, n / 2)
+    } else {
+        (old > scan, n - both)
+    }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn heap_pipeline_visits_each_job_once() {
+    for old in 0..12 {
+        for scan in 0..12 {
+            let mut visited = (0..old + scan).map(|n| heap_pipeline_job(n, old, scan)).collect::<Vec<_>>();
+            visited.sort_unstable();
+            let expected = (0..scan).map(|i| (false, i)).chain((0..old).map(|i| (true, i))).collect::<Vec<_>>();
+            assert_eq!(visited, expected);
+        }
+    }
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -646,6 +730,10 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     host::lifetime_line(frames);
+    let [rounds, old_jobs, scans, mixed, old_work, scan_work, classify] = HEAP_PIPELINE_STATS.each_ref()
+        .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames.max(1.0));
+    tracing::info!("descriptor pipeline (VICTORY_HEAP_PIPELINE={}): {:.1} mixed rounds/frame, {:.1} aged jobs, {:.1} scan jobs, {:.2} ms combined wall, {:.2} ms aged worker sum, {:.2} ms scan worker sum, {:.2} ms deferred classification",
+        u8::from(heap_pipeline()), rounds, old_jobs, scans, mixed / 1000.0, old_work / 1000.0, scan_work / 1000.0, classify / 1000.0);
     let [full, scoped, visited, skipped] = SCOPE_STATS.each_ref()
         .map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!("descriptor dependencies per frame (VICTORY_DESCRIPTOR_DEPENDENCIES={}): {:.1} full rounds, {:.1} scoped rounds, {:.1} heaps processed, {:.1} heaps skipped",
